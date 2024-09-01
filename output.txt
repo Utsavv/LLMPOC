@@ -1,0 +1,3547 @@
+IF OBJECT_ID('dbo.UC_RPT_PlayerTierEarning') IS NOT NULL
+  DROP PROCEDURE dbo.UC_RPT_PlayerTierEarning;
+GO
+
+
+
+IF OBJECT_ID('dbo.UC_RPT_PlayerTierEarning') IS NOT NULL
+  DROP PROCEDURE dbo.UC_RPT_PlayerTierEarning;
+GO
+
+CREATE PROCEDURE dbo.UC_RPT_PlayerTierEarning
+(
+  @PropertyID varchar(max) = NULL, @TransactionFrom datetime = NULL,
+  @TransactionTo datetime = NULL, @PlayerId char(12) = NULL
+)
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  IF (
+       @PropertyID IS NULL
+       AND @TransactionFrom IS NULL
+       AND @TransactionTo IS NULL
+       AND @PlayerId IS NULL
+     )
+  BEGIN
+    SELECT @TransactionFrom = DATEADD(DAY, -30, GETDATE()),
+      @TransactionTo = GETDATE();
+  END;
+
+  IF @TransactionFrom IS NOT NULL
+  BEGIN
+    SET @TransactionFrom = DATEADD(dd, DATEDIFF(dd, 0, @TransactionFrom), 0);
+  END;
+
+  IF @TransactionTo IS NOT NULL
+  BEGIN
+    SET @TransactionTo = DATEADD(dd, DATEDIFF(dd, 0, @TransactionTo + 1), 0);
+  END;
+
+  SELECT PLA.UniversalPlayerID PlayerID, PLA.FullName PlayerName,
+    CASE
+      WHEN tpd.ExternalTransaction IS NOT NULL
+        OR tpd.CreatedBy IN ('Kiosk', 'OLK Gateway') THEN NULL
+      WHEN TPD.TransactionTypeID IN (20028, 20029) THEN 'Tier Bonus'
+      ELSE ORR.OverrideReason
+    END AdjustmentReason, TPD.TierPoint Earned, TPD.TransactionDate,
+    CASE
+      WHEN tpd.ExternalTransaction IS NOT NULL
+        OR tpd.CreatedBy IN ('Kiosk', 'OLK Gateway') THEN tpd.CreatedBy
+      WHEN TPD.TransactionTypeID IN (20028, 20029) THEN 'NA'
+      ELSE ORL.LoginUserName
+    END UserName,
+    CASE
+      WHEN tpd.ExternalTransaction IS NOT NULL
+        OR tpd.CreatedBy IN ('Kiosk', 'OLK Gateway') THEN tpd.CreatedBy
+      WHEN TPD.TransactionTypeID IN (20028, 20029) THEN 'System'
+      ELSE ORL.SupervisorLogin
+    END Authorizer, PRO.PropertyName,
+    CASE
+      WHEN tpd.ExternalTransaction IS NOT NULL
+        OR tpd.CreatedBy IN ('Kiosk', 'OLK Gateway') THEN 'Reward'
+      WHEN TPD.TransactionTypeID IN (20028, 20029) THEN
+        transType.TransactionTypeName
+      WHEN ORL.TransactionID IS NULL THEN 'EARNED'
+      ELSE 'ADJUSTED'
+    END ADJ, MIN(TPD.GamingDate) OVER (ORDER BY TPD.GamingDate) AS FromDate,
+    MAX(TPD.GamingDate) OVER (ORDER BY TPD.GamingDate) AS ToDate,
+    transType.TransactionTypeName AS driverForPtsEarned
+  FROM dbo.UC_PL_TierPointDetail TPD WITH (NOLOCK)
+    INNER JOIN dbo.UC_X_Property PRO ON PRO.PropertyID = TPD.PropertyID
+    INNER JOIN dbo.UC_PL_Player PLA WITH (NOLOCK) ON PLA.PlayerID = TPD.PlayerID
+    LEFT OUTER JOIN dbo.ufnSplit(@PropertyID) filteredProps ON PRO.PropertyID = filteredProps.ID
+    LEFT JOIN dbo.UC_L_OverrideLog ORL WITH (NOLOCK) ON ORL.TransactionID = TPD.TierPointDetailID
+                                                       AND ORL.PlayerId = PLA.PlayerID
+    LEFT JOIN dbo.UC_X_OverrideReason ORR ON ORR.ID = ORL.ReasonID
+    LEFT JOIN dbo.UC_X_TransactionType transType ON TPD.TransactionTypeID = transType.TransactionTypeID
+  WHERE (@TransactionFrom IS NULL OR TPD.GamingDate >= @TransactionFrom)
+    AND (@TransactionTo IS NULL OR TPD.GamingDate < @TransactionTo)
+    AND
+    (
+      @PropertyID IS NULL
+      OR TPD.PropertyId IN (SELECT ID FROM dbo.ufnSplit(@PropertyID) )
+    )
+    AND (@PlayerId IS NULL OR @PlayerId = '' OR PLA.UniversalPlayerID = @PlayerId)
+  OPTION (RECOMPILE);
+
+END;
+GO
+------STARTING NEW SP------
+
+CREATE OR ALTER PROCEDURE dbo.usp_RPT_BucketLiabilityDetail_sel
+(
+  @BucketViewID nvarchar(MAX), @PropertyID nvarchar(MAX) = NULL,
+  @UniversalID nvarchar(MAX) = NULL, @FromDate date, @ToDate date,
+  @TZ nvarchar(8), @ReportType nvarchar(7) = 'Detail'
+)
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  BEGIN TRY
+    DECLARE @TimeZone nvarchar(64), @EGMInterfaceID smallint,
+      @BucketAwardInitiatorID smallint, @PromoOfferInitiatorID smallint,
+      @EarningTransactionTypeID smallint, @RedeemTransactionTypeID smallint,
+      @CEPInTransactionTypeID smallint, @NCEPInTransactionTypeID smallint,
+      @AdjustmentTransactionTypeID smallint, @CEPOutTransactionTypeID smallint,
+      @NCEPOutTransactionTypeID smallint, @ExpiredTransactionTypeID smallint,
+      @DepositTransactionTypeID smallint, @RewardTransactionTypeID smallint,
+      @TierBonusInitiatorID smallint, @SpeedMediaInterfaceID smallint,
+      @OneLinkInterfaceID smallint, @KioskInterfaceID smallint,
+      @MobilityInterfaceID smallint,
+      @SQL nvarchar(MAX),
+      @tBucketViewPrimaryBucketView AS dbo.tBucketViewPrimaryBucketView,
+      @tProperties AS dbo.tProperties, @tPlayerID AS dbo.tPlayerID,
+      @PromoBucketViewID smallint;
+
+    DECLARE @PropertyList table (PropertyID bigint PRIMARY KEY);
+    DECLARE @UniversalIDList TABLE (UniversalID nvarchar(12) PRIMARY KEY NOT NULL, PlayerID bigint NOT NULL);
+    DECLARE @BucketViewList TABLE
+    (
+      BucketViewID bigint NOT NULL PRIMARY KEY,
+      PrimaryBucketViewID bigint NOT NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL,
+      BucketViewDisplayName nvarchar(256) NOT NULL
+    );
+
+    DROP TABLE IF EXISTS #MaxPropertyPlayerBalance;
+    CREATE TABLE #MaxPropertyPlayerBalance
+    (
+      PrimaryBucketViewID bigint NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      MaxPropertyBalance money NOT NULL
+    );
+    
+    UPDATE #MaxPropertyPlayerBalance
+    SET PropertyID = 100001
+
+    DROP TABLE IF EXISTS #FinalMaxPropertyPlayerBalance;
+    CREATE TABLE #FinalMaxPropertyPlayerBalance
+    (
+      PrimaryBucketViewID bigint NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      PropertyName varchar(50) NOT NULL,
+      MaxPropertyBalance money NOT NULL
+    );
+
+    DROP TABLE IF EXISTS #ResultSet;
+    CREATE TABLE #ResultSet
+    (
+      EarnedProperty varchar(50) NULL,
+      UniversalID char(12) NULL,
+      LastName varchar(50) NULL,
+      FirstName varchar(50) NULL,
+      LastPlayedDate datetime NULL,
+      TierName varchar(50) NULL,
+      ForeigRedemptionRegion varchar(100) NULL,
+      ForeignProperty varchar(50) NULL,
+      ForeignRedemptionDateTime datetime2 NULL,
+      ForeignRedemptionOutletEGMRedeemed varchar(50) NULL,
+      CompName varchar(50) NULL,
+      BeginningBalance money NULL,
+      EarnedAwarded money NULL,
+      RedemptionOnEarnedLocation money NULL,
+      ForeignRedemption money NULL,
+      EgmDownloads money NULL,
+      ForeignEgmDownloads money NULL,
+      NcepOut money NULL,
+      ForeignNcepOut money NULL,
+      Adjustment money NULL,
+      ExternalRewards money NULL,
+      Expirations money NULL,
+      ChangeInLiability money NULL,
+      EndingBalance money NULL,
+      Voided money NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL
+    );
+
+    IF @ReportType = 'Summary'
+    BEGIN
+      SELECT EarnedProperty, UniversalID, LastName, FirstName, LastPlayedDate,
+        TierName, ForeigRedemptionRegion, ForeignProperty,
+        ForeignRedemptionDateTime, ForeignRedemptionOutletEGMRedeemed,
+        CompName, BeginningBalance, EarnedAwarded, RedemptionOnEarnedLocation,
+        ForeignRedemption, EgmDownloads, ForeignEgmDownloads, NcepOut,
+        ForeignNcepOut, Adjustment, ExternalRewards, Expirations,
+        ChangeInLiability, EndingBalance, Voided, CurrencySymbol, DataPrecision
+      FROM #ResultSet;
+      RETURN;
+    END;
+
+
+    SELECT @PromoBucketViewID = BV.BucketViewID
+    FROM dbo.BucketSettings BS
+      INNER JOIN dbo.BucketSettingsConfig BSC ON BSC.BucketSettingID = BS.BucketSettingID
+      INNER JOIN dbo.BucketViewBuckets BVB ON BVB.BucketID = BS.BucketID
+      INNER JOIN dbo.BucketViews BV ON BV.BucketViewID = BVB.BucketViewID
+    WHERE BSC.SettingKey = 'IsFreePlay'
+      AND BS.Value = 1;
+
+    IF @PropertyID IS NULL
+    BEGIN
+      INSERT @PropertyList (PropertyID)
+      SELECT p.PropertyID
+      FROM dbo.UC_X_Property p
+        INNER JOIN dbo.UC_X_Host h ON (p.PropertyID = h.PropertyID)
+      WHERE p.Active = 1
+        AND h.IsUniverse = 0;
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO @PropertyList (PropertyID)
+      SELECT value FROM STRING_SPLIT(@PropertyID, ',');
+    END;
+
+    INSERT INTO @UniversalIDList (UniversalID, PlayerID)
+    SELECT U.value, P.PlayerID
+    FROM STRING_SPLIT(@UniversalID, ',') U
+      INNER JOIN dbo.UC_PL_Player P ON P.UniversalPlayerID = U.value;
+
+    INSERT INTO @BucketViewList
+    (
+      BucketViewID, PrimaryBucketViewID, CurrencySymbol, DataPrecision,
+      BucketViewDisplayName
+    )
+    SELECT UBVFR.BucketViewID, UBVFR.PrimaryBucketViewID, b1.Symbol,
+      b1.DataPrecision, bv.BucketViewDisplayName
+    FROM dbo.udf_BucketViewsForReports(
+                                        @BucketViewID,
+                                        'CompItems,IsTierPoints,IsFreePlay,DiscretionaryComp,IsRedeemableAtEGM'
+                                      ) AS UBVFR
+      INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.PrimaryBucketViewID = bvb.BucketViewID
+                                             AND bvb.IsPrimaryEarningBucket = 1
+      INNER JOIN dbo.BucketViews bv ON bvb.BucketViewID = bv.BucketViewID
+      INNER JOIN dbo.Buckets b ON b.BucketID = bvb.BucketID
+      CROSS APPLY
+    (
+      SELECT bkt.DataPrecision, c.Symbol
+      FROM dbo.Buckets bkt
+        INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.PrimaryBucketViewID = bvb.BucketViewID
+                                               AND bvb.IsPrimaryEarningBucket = 1
+        LEFT JOIN dbo.Currencies c ON bkt.CurrencyID = c.CurrencyID
+      WHERE bkt.BucketID = bvb.BucketID
+    ) b1;
+
+    SELECT @BucketAwardInitiatorID = IIF(Name = 'BucketAwards',
+                                     TransactionInitiatorID,
+                                     @BucketAwardInitiatorID),
+      @PromoOfferInitiatorID = IIF(Name = 'PromoOffer',
+                               TransactionInitiatorID,
+                               @PromoOfferInitiatorID),
+      @TierBonusInitiatorID = IIF(Name = 'TierBonus',
+                              TransactionInitiatorID,
+                              @TierBonusInitiatorID)
+    FROM dbo.TransactionInitiators
+    WHERE Name IN ('BucketAwards', 'PromoOffer', 'TierBonus');
+
+    SELECT @SpeedMediaInterfaceID = IIF(InterfaceName = 'SpeedMedia',
+                                    InterfaceID,
+                                    @SpeedMediaInterfaceID),
+      @EGMInterfaceID = IIF(InterfaceName = 'EGM', InterfaceID, @EGMInterfaceID),
+      @OneLinkInterfaceID = IIF(InterfaceName = 'OneLink',
+                            InterfaceID,
+                            @OneLinkInterfaceID),
+      @KioskInterfaceID = IIF(InterfaceName = 'Kiosk',
+                          InterfaceID,
+                          @KioskInterfaceID),
+      @MobilityInterfaceID = IIF(InterfaceName = 'Mobility',
+                          InterfaceID,
+                          @MobilityInterfaceID)
+    FROM dbo.Interfaces
+    WHERE InterfaceName IN ('SpeedMedia', 'EGM', 'OneLink', 'Kiosk', 'Mobility');
+
+    SELECT @EarningTransactionTypeID = IIF(Name = 'Earning',
+                                       TransactionTypeID,
+                                       @EarningTransactionTypeID),
+      @AdjustmentTransactionTypeID = IIF(Name = 'Adjustment',
+                                     TransactionTypeID,
+                                     @AdjustmentTransactionTypeID),
+      @RedeemTransactionTypeID = IIF(Name = 'Redeem',
+                                 TransactionTypeID,
+                                 @RedeemTransactionTypeID),
+      @ExpiredTransactionTypeID = IIF(Name = 'Expired',
+                                  TransactionTypeID,
+                                  @ExpiredTransactionTypeID),
+      @CEPInTransactionTypeID = IIF(Name = 'CEPIn',
+                                TransactionTypeID,
+                                @CEPInTransactionTypeID),
+      @CEPOutTransactionTypeID = IIF(Name = 'CEPOut',
+                                 TransactionTypeID,
+                                 @CepOutTransactionTypeID),
+      @NCEPInTransactionTypeID = IIF(Name = 'NCEPIn',
+                                 TransactionTypeID,
+                                 @NCEPInTransactionTypeID),
+      @NCEPOutTransactionTypeID = IIF(Name = 'NCEPOut',
+                                  TransactionTypeID,
+                                  @NCEPOutTransactionTypeID),
+      @DepositTransactionTypeID = IIF(Name = 'Deposit',
+                                  TransactionTypeID,
+                                  @DepositTransactionTypeID),
+      @RewardTransactionTypeID = IIF(Name = 'Reward',
+                                 TransactionTypeID,
+                                 @RewardTransactionTypeID)
+    FROM dbo.TransactionTypes
+    WHERE Name IN ('Earning', 'Adjustment', 'Redeem', 'Expired', 'CEPIn',
+                    'CEPOut', 'NCEPIn', 'NCEPOut', 'Deposit', 'Reward'
+                  );
+
+    INSERT INTO @tBucketViewPrimaryBucketView (BucketViewID,
+                                              PrimaryBucketViewID
+                                              )
+    SELECT BucketViewID, PrimaryBucketViewID FROM @BucketViewList;
+
+    INSERT INTO @tProperties (PropertyID)
+    SELECT PropertyID FROM @PropertyList
+    UNION ALL
+    SELECT H.PropertyID
+    FROM dbo.UC_X_Property P
+      INNER JOIN dbo.UC_X_Host H ON H.PropertyID = P.PropertyID
+    where H.IsUniverse = 1;
+
+    INSERT INTO @tPlayerID (PlayerID) SELECT PlayerID FROM @UniversalIDList;
+
+    SELECT @TimeZone = UXT.StandardName
+    FROM dbo.UC_X_Timezones AS UXT
+    WHERE UXT.StandardAbbreviation = @TZ
+      OR UXT.DaylightAbbreviation = @TZ;
+
+    IF @TimeZone IS NULL
+      SELECT @TimeZone = UXP.TimeZone
+      FROM dbo.UC_X_Property AS UXP
+        INNER JOIN dbo.UC_X_Host h ON UXP.PropertyID = h.PropertyID
+      WHERE h.IsUniverse = 1;
+
+    EXEC dbo.isp_RunningBalancePropertyWithPlayer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+      @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+      @FromDate = @FromDate, @UniversalID = @UniversalID,
+      @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+      @PromoOfferInitiatorID = @PromoOfferInitiatorID;
+
+    SET @SQL = 'CREATE NONCLUSTERED INDEX '
+               + 'nc_FinalMaxPropertyPlayerBalance_'
+               + CAST(REPLACE(NEWID(), '-', '_') AS varchar(64))
+               + ' 
+    ON #FinalMaxPropertyPlayerBalance(PlayerID,PrimaryBucketViewID,PropertyID) INCLUDE (MaxPropertyBalance)';
+
+    EXECUTE sys.sp_executesql @Stmt = @SQL;
+    SET @SQL = NULL;
+
+    IF EXISTS (SELECT 1 FROM @BucketViewList WHERE BucketViewID = @PromoBucketViewID)
+    BEGIN
+      INSERT INTO #ResultSet
+      (
+        EarnedProperty, UniversalID, LastName, FirstName, LastPlayedDate,
+        TierName, ForeigRedemptionRegion, ForeignProperty,
+        ForeignRedemptionDateTime, ForeignRedemptionOutletEGMRedeemed,
+        CompName, BeginningBalance, EarnedAwarded, RedemptionOnEarnedLocation,
+        ForeignRedemption, EgmDownloads, ForeignEgmDownloads, NcepOut,
+        ForeignNcepOut, Adjustment, ExternalRewards, Expirations,
+        ChangeInLiability, EndingBalance, Voided, CurrencySymbol, DataPrecision
+      )
+      SELECT a.EarnedProperty, a.UniversalID, a.LastName, a.FirstName,
+        a.LastPlayedDate, a.TierName, a.ForeigRedemptionRegion,
+        a.ForeignProperty, a.ForeignRedemptionDateTime,
+        a.ForeignRedemptionOutletEGMRedeemed, a.CompName, a.BeginningBalance,
+        a.EarnedAwarded, a.RedemptionOnEarnedLocation, a.ForeignRedemption,
+        a.EgmDownloads, a.ForeignEgmDownloads, a.NcepOut, a.ForeignNcepOut,
+        a.Adjustment, a.ExternalRewards, a.Expirations,
+        (a.EarnedAwarded + a.RedemptionOnEarnedLocation + a.ForeignRedemption
+         + a.EgmDownloads + a.ForeignEgmDownloads + a.NcepOut
+         + a.ForeignNcepOut + a.Adjustment + a.ExternalRewards + a.Expirations
+         + a.Voided
+        ) AS ChangeInLiability,
+        (a.BeginningBalance + a.EarnedAwarded + a.RedemptionOnEarnedLocation
+         + a.ForeignRedemption + a.EgmDownloads + a.ForeignEgmDownloads
+         + a.NcepOut + a.ForeignNcepOut + a.Adjustment + a.ExternalRewards
+         + a.Expirations + a.Voided
+        ) EndingBalance, a.Voided, a.CurrencySymbol,
+        a.DataPrecision
+      FROM
+      (
+        SELECT t.EarnedProperty, t.UniversalPlayerID UniversalID, t.LastName,
+          t.FirstName, t.LastPlayedDate, t.TierName, t.ForeigRedemptionRegion,
+          t.ForeignProperty, t.PrimaryBucketViewID,
+          t.ForeignRedemptionDateTime, t.ForeignRedemptionOutletEGMRedeemed,
+          t.CompName, ISNULL(t.PromoRunningBalance, 0) AS BeginningBalance,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @EarningTransactionTypeID
+                       OR
+                       (
+                         t.TransactionInitiatorID = @TierBonusInitiatorID
+                         AND t.TransactionTypeID <> @ExpiredTransactionTypeID
+                       ),
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS EarnedAwarded,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @RedeemTransactionTypeID
+                       AND t.EarnedPropertyID = t.UsagePropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS RedemptionOnEarnedLocation,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @RedeemTransactionTypeID
+                       AND t.EarnedPropertyID <> t.UsagePropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS ForeignRedemption,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @NCEPInTransactionTypeID
+                       AND t.IsVoid = 0
+                       AND t.UsagePropertyID = t.EarnedPropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS EgmDownloads,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @NCEPInTransactionTypeID
+                       AND t.IsVoid = 0
+                       AND t.UsagePropertyID <> t.EarnedPropertyID,
+                    t.UsageBucketAmount,
+                    0.0),
+                  0.0
+                ) AS ForeignEgmDownloads,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @NCEPOutTransactionTypeID
+                       AND (t.EarnedPropertyID = t.UsagePropertyID OR t.UsagePropertyID IS NULL),
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS NcepOut,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @NCEPOutTransactionTypeID
+                       AND t.EarnedPropertyID <> t.UsagePropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS ForeignNcepOut,
+          ISNULL(
+                  IIF(t.TransactionTypeID = @AdjustmentTransactionTypeID,
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS Adjustment,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID IN (@DepositTransactionTypeID,
+                                           @RewardTransactionTypeID
+                                           )
+                       AND t.InterfaceID IN (@SpeedMediaInterfaceID,
+                                            @OneLinkInterfaceID,
+                                            @KioskInterfaceID,
+                                            @MobilityInterfaceID),
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS ExternalRewards,
+          ISNULL(
+                  IIF(t.TransactionTypeID = @ExpiredTransactionTypeID,
+                  t.UsageBucketAmount,
+                  0),
+                  0.0
+                ) AS Expirations,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @NCEPInTransactionTypeID
+                       AND t.IsVoid = 1,
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS Voided, t.CurrencySymbol, t.DataPrecision
+        FROM
+        (
+          SELECT t.EarnedProperty, pl.UniversalPlayerID, pl.LastName,
+            pl.FirstName, ppl.LastPlayedDate, tx.TierName,
+            t.PrimaryBucketViewID, t.TransactionTypeID,
+            t.TransactionInitiatorID, t.EarnedPropertyID, t.UsagePropertyID,
+            t.IsVoid, t.InterfaceID, t.UsageBucketAmount, t.SourceBucketAmount,
+            ISNULL(bb.MaxPropertyBalance, 0.00)
+            + ISNULL(
+                      SUM(IIF(
+                            ISNULL(t.SourcePropertyGroupID, t.PropertyGroupID) = 0
+                               AND t.PBTPromoMethod = 'U',
+                            IIF(t.UsageBucketAmount = 0.00,
+                            t.SourceBucketAmount,
+                            t.UsageBucketAmount),
+                            0.00)
+                         ) OVER (PARTITION BY t.PlayerID, T.PrimaryBucketViewID
+                                 ORDER BY T.TransactionDTO, t.TransactionID
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                ),
+                      0.0
+                    )
+            + ISNULL(
+                      SUM(IIF(
+                            ISNULL(t.SourcePropertyGroupID, t.PropertyGroupID) <> 0,
+                            IIF(t.UsageBucketAmount = 0.00,
+                            t.SourceBucketAmount,
+                            t.UsageBucketAmount),
+                            0.00)
+                         ) OVER (PARTITION BY t.PlayerID,
+                                   T.PrimaryBucketViewID,
+                                   t.EarnedPropertyID
+                                 ORDER BY T.TransactionDTO,
+                                   t.TransactionID
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                ),
+                      0.0
+                    ) AS PromoRunningBalance, t.CurrencySymbol,
+            t.DataPrecision, pru.PropertyName ForeignProperty,
+            ru.RegionName ForeigRedemptionRegion, c.CompName, t.Bucket,
+            t.PlayerID,
+            CONVERT(
+                     datetime2,
+                     CONVERT(datetimeoffset(7), t.TransactionDTO)AT TIME ZONE @TimeZone
+                   ) AS ForeignRedemptionDateTime,
+            IIF(t.InterfaceID = @EGMInterfaceID,
+              CAST(t.MachineID AS varchar(64)),
+              IIF(tc.CompItemID IS NOT NULL, uo.OutletName, uon.OutletName)) AS ForeignRedemptionOutletEGMRedeemed
+          FROM
+          (
+            SELECT ISNULL(uxp.PropertyName,t.PropertyName) EarnedProperty, tr.PlayerID,
+              t.PrimaryBucketViewID, tr.TransactionTypeID,
+              tr.TransactionInitiatorID, ISNULL(tu.TransactionPropertyID,t.EarnedPropertyID) AS EarnedPropertyID,
+              tr.TransactionPropertyID UsagePropertyID, tr.IsVoid,
+              tr.InterfaceID, t.PropertyGroupID,
+              SUM(
+                 ISNULL(
+                       IIF(tu.TransactionID IS NOT NULL, lu.BucketAmount, NULL),
+                       0.00
+                       )
+                 ) UsageBucketAmount,
+              SUM(ISNULL(ls.BucketAmount, 0.0)) SourceBucketAmount,
+              t.CurrencySymbol, t.DataPrecision, TR.TransactionDTO,
+              TR.MachineID, t.BucketViewDisplayName AS Bucket,
+              t.ParentTransactionID, Tu.PropertyGroupID SourcePropertyGroupID,
+              t.PBTPromoMethod, t.TransactionID
+            FROM
+            (
+              SELECT t.TransactionID, t.PlayerID, p.PropertyName,
+                pgl.PropertyGroupID, bvl.PrimaryBucketViewID, t.GamingDate,
+                p.propertyid EarnedPropertyID, bvl.CurrencySymbol,
+                bvl.DataPrecision,
+                ISNULL(t.ParentTransactionID, t.TransactionID) ParentTransactionID,
+                bvl.BucketViewDisplayName, P.PBTPromoMethod
+              FROM EB.Transactions t WITH (NOLOCK)
+                INNER JOIN dbo.PropertyGroupList pgl ON t.PropertyGroupID = pgl.PropertyGroupID
+                INNER JOIN dbo.UC_X_Property p ON IIF(t.PropertyGroupID = 0,
+                                                  t.TransactionPropertyID,
+                                                  pgl.PropertyID) = p.PropertyID
+                INNER JOIN @bucketviewList bvl ON t.BucketViewID = bvl.BucketViewID
+                INNER JOIN @PropertyList PRL ON PRL.PropertyID = p.PropertyID
+                LEFT JOIN @UniversalIDList ul ON ul.PlayerID = t.PlayerID
+              WHERE (t.GamingDate >= @FromDate AND t.GamingDate <= @ToDate)
+                AND (@UniversalID IS NULL OR ul.PlayerID IS NOT NULL)
+                AND t.TransactionInitiatorID NOT IN (@PromoOfferInitiatorID,
+                                                    @BucketAwardInitiatorID
+                                                    )
+            ) t
+              INNER JOIN EB.Transactions TR WITH (NOLOCK) ON TR.TransactionID = t.TransactionID
+              LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                                AND ls.UsageTransactionID IS NULL
+              LEFT JOIN eb.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+              LEFT JOIN eb.Transactions tu WITH (NOLOCK) ON lu.SourceTransactionID = tu.TransactionID
+                                                           AND tu.TransactionInitiatorID NOT IN (
+                                                                                                @PromoOfferInitiatorID,
+                                                                                                @BucketAwardInitiatorID
+                                                                                                )
+              LEFT JOIN dbo.PropertyGroupList pglu ON tu.PropertyGroupID = pglu.PropertyGroupID
+              LEFT JOIN dbo.UC_X_Property AS uxp ON tu.TransactionPropertyID = uxp.PropertyID
+            GROUP BY t.PropertyName, tr.PlayerID, t.PrimaryBucketViewID,
+              tr.TransactionTypeID, tr.TransactionInitiatorID,
+              t.EarnedPropertyID, tu.TransactionPropertyID, tr.IsVoid,
+              tr.InterfaceID, t.PropertyGroupID, t.CurrencySymbol,
+              t.DataPrecision, tr.TransactionDTO, t.BucketViewDisplayName,
+              t.ParentTransactionID, TR.MachineID, tu.PropertyGroupID,
+              t.PBTPromoMethod, t.TransactionID,uxp.PropertyName,TR.TransactionPropertyID
+          ) t
+            INNER JOIN dbo.UC_PL_Player pl ON T.PlayerID = pl.PlayerID
+            INNER JOIN dbo.UC_PL_Tier pt WITH (NOLOCK) ON pl.PlayerID = pt.PlayerID
+            INNER JOIN dbo.UC_X_Tier tx ON pt.TierID = tx.TierID
+            OUTER APPLY
+          (
+            SELECT MAX(ppl.LastPlayedDate) LastPlayedDate
+            FROM dbo.UC_PL_PropPlay ppl WITH (NOLOCK)
+            WHERE PPL.PlayerID = t.PlayerID
+              AND PPL.PropertyID = T.EarnedPropertyID
+          ) ppl
+            LEFT JOIN EB.TransactionCompReferences tc WITH (NOLOCK) ON tc.TransactionID = t.ParentTransactionID
+            LEFT JOIN EB.TransactionNonCompReferences tnc WITH (NOLOCK) ON tnc.TransactionID = t.ParentTransactionID
+            LEFT JOIN dbo.UC_X_CompItem c ON tc.CompItemID = c.CompItemID
+            LEFT JOIN dbo.UC_X_Outlet uo ON uo.OutletID = c.OutletID
+            LEFT JOIN dbo.UC_X_Outlet uon ON uon.OutletID = tnc.OutletID
+            LEFT JOIN dbo.UC_X_Property pru ON t.UsagePropertyID = pru.PropertyID
+            LEFT JOIN dbo.UC_X_Region ru ON pru.RegionID = ru.RegionID
+            LEFT JOIN #FinalMaxPropertyPlayerBalance bb ON t.PlayerID = bb.PlayerID
+                                                          AND t.EarnedPropertyID = bb.PropertyID
+                                                          AND t.PrimaryBucketViewID = bb.PrimaryBucketViewID
+          WHERE IIF(t.UsageBucketAmount = 0.00,
+                t.SourceBucketAmount,
+                t.UsageBucketAmount) <> 0
+        ) t
+      ) a
+      OPTION (RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+
+      DROP TABLE IF EXISTS #BalBef;
+      CREATE TABLE #BalBef
+      (
+        BalBefID int IDENTITY(1, 1) PRIMARY KEY,
+        BeginningBalance money NULL,
+        PlayerID bigint NOT NULL,
+        PrimaryBucketViewID smallint NOT NULL
+      );
+
+      INSERT INTO #BalBef (PlayerID, PrimaryBucketViewID, BeginningBalance)
+      SELECT PlayerID, PrimaryBucketViewID, SUM(MaxPropertyBalance)
+      FROM #FinalMaxPropertyPlayerBalance
+      GROUP BY PlayerID, PrimaryBucketViewID;
+
+      INSERT INTO #ResultSet
+      (
+        EarnedProperty, UniversalID, LastName, FirstName, LastPlayedDate,
+        TierName, ForeigRedemptionRegion, ForeignProperty,
+        ForeignRedemptionDateTime, ForeignRedemptionOutletEGMRedeemed,
+        CompName, BeginningBalance, EarnedAwarded, RedemptionOnEarnedLocation,
+        ForeignRedemption, EgmDownloads, ForeignEgmDownloads, NcepOut,
+        ForeignNcepOut, Adjustment, ExternalRewards, Expirations,
+        ChangeInLiability, EndingBalance, Voided, CurrencySymbol, DataPrecision
+      )
+      SELECT a.EarnedProperty, a.UniversalID, a.LastName, a.FirstName,
+        a.LastPlayedDate, a.TierName, a.ForeigRedemptionRegion,
+        a.ForeignProperty, a.ForeignRedemptionDateTime,
+        a.ForeignRedemptionOutletEGMRedeemed, a.CompName, a.BeginningBalance,
+        a.EarnedAwarded, a.RedemptionOnEarnedLocation, a.ForeignRedemption,
+        a.EgmDownloads, a.ForeignEgmDownloads, 0.00 AS NcepOut,
+        0.00 AS ForeignNcepOut, a.Adjustment, a.ExternalRewards, a.Expirations,
+        (a.EarnedAwarded + a.RedemptionOnEarnedLocation + a.ForeignRedemption
+         + a.EgmDownloads + a.ForeignEgmDownloads + a.Adjustment
+         + a.ExternalRewards + a.Expirations + a.Voided
+        ) AS ChangeInLiability,
+        (a.BeginningBalance + a.EarnedAwarded + a.RedemptionOnEarnedLocation
+         + a.ForeignRedemption + a.EgmDownloads + a.ForeignEgmDownloads
+         + a.Adjustment + a.ExternalRewards + a.Expirations + a.Voided
+        ) EndingBalance,
+        a.Voided, a.CurrencySymbol, a.DataPrecision
+      FROM
+      (
+        SELECT t.EarnedProperty, t.UniversalPlayerID UniversalID, t.LastName,
+          t.FirstName, t.LastPlayedDate, t.TierName, t.ForeigRedemptionRegion,
+          t.ForeignProperty, t.PrimaryBucketViewID,
+          t.ForeignRedemptionDateTime, t.ForeignRedemptionOutletEGMRedeemed,
+          t.CompName,
+          ISNULL(t.OtherBucketsRunningBalance, 0) AS BeginningBalance,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @EarningTransactionTypeID
+                       OR
+                       (
+                         t.TransactionInitiatorID = @TierBonusInitiatorID
+                         AND t.TransactionTypeID <> @ExpiredTransactionTypeID
+                       ),
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS EarnedAwarded,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @RedeemTransactionTypeID
+                       AND t.EarnedPropertyID = t.UsagePropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS RedemptionOnEarnedLocation,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @RedeemTransactionTypeID
+                       AND t.EarnedPropertyID <> t.UsagePropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS ForeignRedemption,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @CEPInTransactionTypeID
+                       AND t.IsVoid = 0
+                       AND t.UsagePropertyID = t.EarnedPropertyID,
+                    t.UsageBucketAmount,
+                    0),
+                  0.0
+                ) AS EgmDownloads,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @CEPInTransactionTypeID
+                       AND t.IsVoid = 0
+                       AND t.UsagePropertyID <> t.EarnedPropertyID,
+                    t.UsageBucketAmount,
+                    0.0),
+                  0.0
+                ) AS ForeignEgmDownloads,
+          ISNULL(
+                  IIF(t.TransactionTypeID = @AdjustmentTransactionTypeID,
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS Adjustment,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID IN (@DepositTransactionTypeID,
+                                           @RewardTransactionTypeID
+                                           )
+                       AND t.InterfaceID IN (@SpeedMediaInterfaceID,
+                                            @OneLinkInterfaceID,
+                                            @KioskInterfaceID,
+                                            @MobilityInterfaceID),
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS ExternalRewards,
+          ISNULL(
+                  IIF(t.TransactionTypeID = @ExpiredTransactionTypeID,
+                  t.UsageBucketAmount,
+                  0),
+                  0.0
+                ) AS Expirations,
+          ISNULL(
+                  IIF(
+                    t.TransactionTypeID = @CEPInTransactionTypeID
+                       AND t.IsVoid = 1,
+                    IIF(t.UsageBucketAmount = 0.00,
+                    t.SourceBucketAmount,
+                    t.UsageBucketAmount),
+                    0),
+                  0.0
+                ) AS Voided, t.CurrencySymbol, t.DataPrecision
+        FROM
+        (
+          SELECT t.EarnedProperty, pl.UniversalPlayerID, pl.LastName,
+            pl.FirstName, ppl.LastPlayedDate, tx.TierName,
+            t.PrimaryBucketViewID, t.TransactionTypeID,
+            t.TransactionInitiatorID, t.EarnedPropertyID, t.UsagePropertyID,
+            t.IsVoid, t.InterfaceID, t.SourceBucketAmount, t.UsageBucketAmount,
+            t.CurrencySymbol, t.DataPrecision,
+            ISNULL(bb.BeginningBalance, 0.00)
+            + ISNULL(
+                      SUM(IIF(t.UsageBucketAmount = 0.00,
+                         t.SourceBucketAmount,
+                         t.UsageBucketAmount)
+                         ) OVER (PARTITION BY t.PlayerID,
+                                   T.PrimaryBucketViewID
+                                 ORDER BY T.TransactionDTO,
+                                   t.TransactionID
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                ),
+                      0.0
+                    ) AS OtherBucketsRunningBalance,
+            pru.PropertyName ForeignProperty,
+            ru.RegionName ForeigRedemptionRegion,
+            CONVERT(
+                     datetime2,
+                     CONVERT(datetimeoffset(7), t.TransactionDTO)AT TIME ZONE @TimeZone
+                   ) AS ForeignRedemptionDateTime,
+            IIF(t.InterfaceID = @EGMInterfaceID,
+              CAST(t.MachineID AS varchar(64)),
+              IIF(tc.CompItemID IS NOT NULL, uo.OutletName, uon.OutletName)) AS ForeignRedemptionOutletEGMRedeemed,
+            c.CompName, t.Bucket, t.PlayerID
+          FROM
+          (
+            SELECT ISNULL(uxp.PropertyName,t.PropertyName) EarnedProperty, tr.PlayerID,
+              t.PrimaryBucketViewID, tr.TransactionTypeID,
+              tr.TransactionInitiatorID, ISNULL(tu.TransactionPropertyID,t.EarnedPropertyID) AS EarnedPropertyID,
+              tr.TransactionPropertyID UsagePropertyID, tr.IsVoid,
+              tr.InterfaceID, t.PropertyGroupID,
+              SUM(
+                 ISNULL(
+                       IIF(tu.TransactionID IS NOT NULL, lu.BucketAmount, NULL),
+                       0.00
+                       )
+                 ) UsageBucketAmount,
+              SUM(ISNULL(ls.BucketAmount, 0.0)) SourceBucketAmount,
+              t.CurrencySymbol, t.DataPrecision, TR.TransactionDTO,
+              t.BucketViewDisplayName AS Bucket, t.ParentTransactionID,
+              TR.MachineID, t.TransactionID
+            FROM
+            (
+              SELECT t.TransactionID, t.PlayerID, p.PropertyName,
+                pgl.PropertyGroupID, bvl.PrimaryBucketViewID, t.GamingDate,
+                p.propertyid EarnedPropertyID, bvl.CurrencySymbol,
+                bvl.DataPrecision,
+                ISNULL(t.ParentTransactionID, t.TransactionID) ParentTransactionID,
+                bvl.BucketViewDisplayName
+              FROM EB.Transactions t WITH (NOLOCK)
+                INNER JOIN dbo.PropertyGroupList pgl ON t.PropertyGroupID = pgl.PropertyGroupID
+                INNER JOIN dbo.UC_X_Property p ON pgl.PropertyID = p.PropertyID
+                INNER JOIN @bucketviewList bvl ON t.BucketViewID = bvl.BucketViewID
+                INNER JOIN @PropertyList PRL ON PRL.PropertyID = p.PropertyID
+                LEFT JOIN @UniversalIDList ul ON ul.PlayerID = t.PlayerID
+              WHERE (t.GamingDate >= @FromDate AND t.GamingDate <= @ToDate)
+                AND (@UniversalID IS NULL OR ul.PlayerID IS NOT NULL)
+                AND t.TransactionInitiatorID NOT IN (@PromoOfferInitiatorID,
+                                                    @BucketAwardInitiatorID
+                                                    )
+            ) t
+              INNER JOIN EB.Transactions TR WITH (NOLOCK) ON TR.TransactionID = t.TransactionID
+              LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                                AND ls.UsageTransactionID IS NULL
+              LEFT JOIN eb.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+              LEFT JOIN eb.Transactions tu WITH (NOLOCK) ON lu.SourceTransactionID = tu.TransactionID
+                                                           AND tu.TransactionInitiatorID NOT IN (
+                                                                                                @PromoOfferInitiatorID,
+                                                                                                @BucketAwardInitiatorID
+                                                                                                )
+              LEFT JOIN dbo.PropertyGroupList pglu ON tu.PropertyGroupID = pglu.PropertyGroupID
+              LEFT JOIN dbo.UC_X_Property AS uxp ON tu.TransactionPropertyID = uxp.PropertyID
+            GROUP BY tr.InterfaceID, tr.TransactionID, t.PropertyName,
+              tr.PlayerID, t.PrimaryBucketViewID, tr.TransactionTypeID,
+              tr.TransactionInitiatorID, t.EarnedPropertyID,
+              tu.TransactionPropertyID, tr.IsVoid, t.PropertyGroupID,
+              t.CurrencySymbol, t.DataPrecision, tr.TransactionDTO,
+              t.BucketViewDisplayName, t.ParentTransactionID, TR.MachineID,
+              t.TransactionID,tr.TransactionPropertyID,uxp.PropertyName
+          ) t
+            INNER JOIN dbo.UC_PL_Player pl ON T.PlayerID = pl.PlayerID
+            INNER JOIN dbo.UC_PL_Tier pt WITH (NOLOCK) ON pl.PlayerID = pt.PlayerID
+            INNER JOIN dbo.UC_X_Tier tx ON pt.TierID = tx.TierID
+            OUTER APPLY
+          (
+            SELECT MAX(ppl.LastPlayedDate) LastPlayedDate
+            FROM dbo.UC_PL_PropPlay ppl WITH (NOLOCK)
+            WHERE PPL.PlayerID = t.PlayerID
+              AND PPL.PropertyID = T.EarnedPropertyID
+          ) ppl
+            LEFT JOIN EB.TransactionCompReferences tc WITH (NOLOCK) ON tc.TransactionID = t.ParentTransactionID
+            LEFT JOIN EB.TransactionNonCompReferences tnc WITH (NOLOCK) ON tnc.TransactionID = t.ParentTransactionID
+            LEFT JOIN dbo.UC_X_CompItem c ON tc.CompItemID = c.CompItemID
+            LEFT JOIN dbo.UC_X_Outlet uo ON uo.OutletID = c.OutletID
+            LEFT JOIN dbo.UC_X_Outlet uon ON uon.OutletID = tnc.OutletID
+            LEFT JOIN dbo.UC_X_Property pru ON t.UsagePropertyID = pru.PropertyID
+            LEFT JOIN dbo.UC_X_Region ru ON pru.RegionID = ru.RegionID
+            LEFT JOIN #BalBef bb ON t.PlayerID = bb.PlayerID
+                                   AND t.PrimaryBucketViewID = bb.PrimaryBucketViewID
+          WHERE IIF(t.UsageBucketAmount = 0.00,
+                t.SourceBucketAmount,
+                t.UsageBucketAmount) <> 0
+        ) t
+      ) a
+      OPTION (RECOMPILE);
+    END;
+
+    IF EXISTS (SELECT 1 FROM #ResultSet)
+    BEGIN
+      SELECT EarnedProperty, UniversalID, LastName, FirstName, LastPlayedDate,
+        TierName, ForeigRedemptionRegion, ForeignProperty,
+        ForeignRedemptionDateTime, ForeignRedemptionOutletEGMRedeemed,
+        CompName, BeginningBalance, EarnedAwarded, RedemptionOnEarnedLocation,
+        ForeignRedemption, EgmDownloads, ForeignEgmDownloads, NcepOut,
+        ForeignNcepOut, Adjustment, ExternalRewards, Expirations,
+        ChangeInLiability, EndingBalance, Voided, CurrencySymbol, DataPrecision
+      FROM #ResultSet;
+    END;
+    ELSE
+    BEGIN
+      SELECT DISTINCT NULL EarnedProperty, P.UniversalPlayerID UniversalID,
+        P.LastName, P.FirstName, NULL LastPlayedDate, NULL TierName,
+        NULL ForeigRedemptionRegion, NULL ForeignProperty,
+        NULL ForeignRedemptionDateTime,
+        NULL ForeignRedemptionOutletEGMRedeemed, NULL CompName,
+        ISNULL(bbal.MaxPropertyBalance, 0) BeginningBalance, 0 EarnedAwarded,
+        0 RedemptionOnEarnedLocation, 0 ForeignRedemption, 0 EgmDownloads,
+        0 ForeignEgmDownloads, 0 NcepOut, 0 ForeignNcepOut, 0 Adjustment,
+        0 ExternalRewards, 0 Expirations, 0 ChangeInLiability,
+        ISNULL(bbal.MaxPropertyBalance, 0) EndingBalance, 0 Voided,
+        bv.CurrencySymbol, bv.DataPrecision
+      FROM @UniversalIDList up
+        INNER JOIN dbo.UC_PL_Player P WITH (NOLOCK) ON up.PlayerID = P.PlayerID
+        LEFT JOIN dbo.UC_PL_DomProp dp WITH (NOLOCK) ON dp.PlayerID = P.PlayerID
+        LEFT JOIN dbo.UC_X_Property dprop ON dp.DominantProperty = dprop.PropertyID
+        CROSS APPLY
+      (
+        SELECT DISTINCT PrimaryBucketViewID, BucketViewDisplayName,
+          CurrencySymbol, DataPrecision
+        FROM @BucketViewList
+      ) bv
+        LEFT JOIN #FinalMaxPropertyPlayerBalance bbal ON P.PlayerID = bbal.PlayerID
+                                                        AND bbal.PrimaryBucketViewID = bv.PrimaryBucketViewID
+                                                        AND bbal.PropertyID = dp.DominantProperty;
+    END;
+
+  END TRY
+  BEGIN CATCH
+    THROW;
+  END CATCH;
+END;
+GO
+------STARTING NEW SP------
+
+
+CREATE OR ALTER PROCEDURE dbo.USP_RPT_EGMDownLoads_sel
+  @BucketViewID nvarchar(MAX) = NULL, @PropertyID nvarchar(MAX) = NULL,
+  @UniversalID nvarchar(MAX) = NULL, @FromDate date, @ToDate date,
+  @TZ nvarchar(16)
+AS
+BEGIN
+  SET NOCOUNT ON;
+  BEGIN TRY
+
+    DECLARE @SQL nvarchar(MAX), @Timezone nvarchar(64),
+      @PromoBucketViewID smallint, @BlankMoneyValue money = 0.00,
+      @NCEPInTransactionTypeID smallint, @CEPInTransactionTypeID smallint,
+      @EGMInterfaceID smallint,@tProperties dbo.tProperties, @tPlayerID dbo.tPlayerID,
+      @tBucketViewPrimaryBucketView dbo.tBucketViewPrimaryBucketView,
+      @BucketAwardInitiatorID smallint, @PromoOfferInitiatorID SMALLINT,
+      @NumericBucketTypeID smallint;
+
+    DECLARE @PropertyList table (PropertyID bigint NOT NULL PRIMARY KEY
+                                                            (PropertyID)
+                                );
+    DECLARE @BucketViewList table
+    (
+      BucketViewID smallint NOT NULL,
+      PrimaryBucketViewID smallint NOT NULL,
+      BucketID smallint NOT NULL,
+      PrimaryBucketViewDisplayName nvarchar(256) NOT NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      ConversionCurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL,
+      ConversionRate numeric(11, 5) NULL,
+      PRIMARY KEY (BucketViewID, PrimaryBucketViewID, BucketID)
+    );
+    DECLARE @UniversalPlayerID table (PlayerID bigint PRIMARY KEY);
+
+    DROP TABLE IF EXISTS #FinalMaxPropertyPlayerBalance;
+    CREATE TABLE #FinalMaxPropertyPlayerBalance
+    (
+      PlayerID bigint NOT NULL,
+      PrimaryBucketViewID smallint NOT NULL,
+      PropertyID bigint NOT NULL,
+      PropertyName varchar(50) NOT NULL,
+      MaxPropertyBalance money NOT NULL
+    );
+
+    DROP TABLE IF EXISTS #FinalOfferAwardBalancesProperty;
+    CREATE TABLE #FinalOfferAwardBalancesProperty
+    (
+      PrimaryBucketViewID smallint NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      RunningBalance money NULL,
+      PRIMARY KEY (PrimaryBucketViewID, PlayerID, PropertyID)
+    );
+
+    DROP TABLE IF EXISTS #BalBef;
+    CREATE TABLE #BalBef
+    (
+      BalBefID int IDENTITY(1, 1) PRIMARY KEY,
+      BeginningBalance money NULL,
+      PlayerID bigint NOT NULL,
+      PrimaryBucketViewID smallint NOT NULL
+    );
+
+    DROP TABLE IF EXISTS #FilteredTransactions;
+    CREATE TABLE #FilteredTransactions
+    (
+      TransactionID bigint NOT NULL,
+      PlayerID bigint NOT NULL,
+      TransactionTypeID smallint NOT NULL,
+      TransactionPropertyGroupID int NULL
+    );
+
+    DECLARE @PropertyGroups AS TABLE
+    (
+      PropertyGroupID int NOT NULL,
+      PropertyID BIGINT PRIMARY KEY (PropertyID, PropertyGroupID)
+    );
+
+    SELECT @NumericBucketTypeID = BucketTypeID
+    FROM dbo.BucketTypes
+    WHERE BucketTypeName = 'Numeric';
+
+    INSERT @BucketViewList
+    (
+      BucketViewID, PrimaryBucketViewID, BucketID,
+      PrimaryBucketViewDisplayName, CurrencySymbol, ConversionCurrencySymbol,
+      DataPrecision, ConversionRate
+    )
+    SELECT UBVFR.BucketViewID, UBVFR.PrimaryBucketViewID, b.BucketID,
+      pbv.BucketViewDisplayName, b1.Symbol, b1.ConversionSymbol,
+      b1.DataPrecision,
+      IIF(ISNULL(b.ConversionRate, 0) = 0, 1, b.ConversionRate) ConversionRate
+    FROM dbo.udf_BucketViewsForReports(
+                                      @BucketViewID,
+                                      'IsFreePlay,IsRedeemableAtEGM'
+                                      ) UBVFR
+      INNER JOIN dbo.BucketViews BV ON UBVFR.BucketViewID = BV.BucketViewID
+      INNER JOIN dbo.BucketViewBuckets bvb ON BV.BucketViewID = bvb.BucketViewID
+                                             AND bvb.IsPrimaryEarningBucket = 1
+      INNER JOIN dbo.Buckets b ON b.BucketID = bvb.BucketID
+      INNER JOIN dbo.BucketViews pbv ON UBVFR.PrimaryBucketViewID = pbv.BucketViewID
+      CROSS APPLY
+    (
+      SELECT bkt.DataPrecision, c.Symbol,
+        IIF(bkt.BucketTypeID = @NumericBucketTypeID, Curn.Symbol, c.Symbol) ConversionSymbol
+      FROM dbo.Buckets bkt
+        INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.PrimaryBucketViewID = bvb.BucketViewID
+                                               AND bvb.IsPrimaryEarningBucket = 1
+        LEFT JOIN dbo.Currencies c ON bkt.CurrencyID = c.CurrencyID
+        LEFT JOIN dbo.Currencies Curn ON bkt.ConversionCurrencyID = Curn.CurrencyID
+      WHERE bkt.BucketID = bvb.BucketID
+    ) b1;
+
+    SELECT @NCEPInTransactionTypeID = IIF(Name = 'NCEPIn',
+                                      TransactionTypeID,
+                                      @NCEPInTransactionTypeID),
+      @CEPInTransactionTypeID = IIF(Name = 'CEPIn',
+                                TransactionTypeID,
+                                @CEPInTransactionTypeID)
+    FROM dbo.TransactionTypes
+    WHERE Name IN ('NCEPIn', 'CEPIn');
+
+    SELECT @PromoBucketViewID = bvb.BucketViewID
+    FROM dbo.Buckets b
+      INNER JOIN dbo.BucketViewBuckets bvb on bvb.BucketViewID > 0
+                                             AND bvb.BucketID = b.BucketID
+      INNER JOIN dbo.BucketViews BV ON BV.BucketViewID = BVB.BucketViewID
+      INNER JOIN dbo.BucketSettings bs ON b.BucketID = bs.BucketID
+      INNER JOIN dbo.BucketSettingsConfig bsc ON bs.BucketSettingID = bsc.BucketSettingID
+    WHERE bsc.SettingKey = 'IsFreePlay'
+      AND bs.Value = N'1';
+
+    SELECT @BucketAwardInitiatorID = IIF(Name = 'BucketAwards',
+                                     TransactionInitiatorID,
+                                     @BucketAwardInitiatorID),
+      @PromoOfferInitiatorID = IIF(Name = 'PromoOffer',
+                               TransactionInitiatorID,
+                               @PromoOfferInitiatorID)
+    FROM dbo.TransactionInitiators
+    WHERE Name IN ('BucketAwards', 'PromoOffer');
+
+    SELECT @EGMInterfaceID = InterfaceID
+    FROM dbo.Interfaces
+    WHERE InterfaceName = 'EGM';
+
+    IF @PropertyID IS NULL
+    BEGIN
+      INSERT @Propertylist (PropertyID)
+      SELECT p.PropertyID
+      FROM dbo.UC_X_Property p
+        INNER JOIN dbo.UC_X_Host h ON p.PropertyID = h.PropertyID
+      WHERE p.Active = 1
+        AND h.IsUniverse = 0;
+    END;
+    ELSE
+    BEGIN
+      INSERT @Propertylist (PropertyID)
+      SELECT value FROM STRING_SPLIT(@PropertyID, ',');
+    END;
+
+    IF @UniversalID IS NOT NULL
+    BEGIN
+      INSERT @UniversalPlayerID (PlayerID)
+      SELECT DISTINCT P.PlayerID
+      FROM STRING_SPLIT(@UniversalID, ',') U
+        INNER JOIN dbo.UC_PL_Player P WITH (NOLOCK) ON P.UniversalPlayerID = U.value
+      WHERE p.PlayerID > 0;
+    END;
+
+    INSERT INTO @PropertyGroups (PropertyGroupID, PropertyID)
+    SELECT PG.PropertyGroupID, CONVERT(BIGINT, PG.GroupList)
+    FROM dbo.PropertyGroups PG
+    WHERE CHARINDEX(',', PG.GroupList) = 0;
+
+    INSERT #FilteredTransactions (TransactionID, PlayerID, TransactionTypeID,
+                                 TransactionPropertyGroupID
+                                 )
+    SELECT DISTINCT t.TransactionID, t.PlayerID, t.TransactionTypeID,
+      PGL2.PropertyGroupID
+    FROM EB.Transactions t WITH (NOLOCK)
+      INNER JOIN dbo.PropertyGroupList pgl ON t.PropertyGroupID = pgl.PropertyGroupID
+                                             AND IIF(t.PropertyGroupID = 0,
+                                                 T.TransactionPropertyID,
+                                                 pgl.PropertyID) = T.TransactionPropertyID
+      INNER JOIN dbo.UC_X_Property p ON IIF(t.PropertyGroupID = 0,
+                                        t.TransactionPropertyID,
+                                        pgl.PropertyID) = p.PropertyID
+      INNER JOIN @PropertyGroups PGL2 ON PGL2.PropertyID = T.TransactionPropertyID
+      INNER JOIN @PropertyList PRL ON PRL.PropertyID = p.PropertyID
+      INNER JOIN @BucketViewList bvl ON bvl.BucketViewID = t.BucketViewID
+      LEFT JOIN @UniversalPlayerID up ON up.PlayerID = t.PlayerID
+    WHERE t.GamingDate >= @FromDate
+      AND t.GamingDate <= @ToDate
+      AND (@UniversalID IS NULL OR up.PlayerID IS NOT NULL)
+    OPTION (RECOMPILE);
+
+    SET @SQL = 'CREATE CLUSTERED INDEX ' + 'nc_FilteredTransactions_'
+               + CAST(REPLACE(NEWID(), '-', '_') AS varchar(64))
+               + ' 
+    ON #FilteredTransactions(TransactionID,PlayerID, TransactionTypeID)';
+    EXECUTE sys.sp_executesql @Stmt = @SQL;
+    SET @SQL = NULL;
+
+    SELECT @Timezone = UXT.StandardName
+    FROM dbo.UC_X_Timezones AS UXT
+    WHERE UXT.StandardAbbreviation = @TZ
+      OR UXT.DaylightAbbreviation = @TZ;
+
+    IF @Timezone IS NULL
+    BEGIN
+      SELECT @Timezone = uxp.TimeZone
+      FROM dbo.UC_X_Property AS uxp
+        INNER JOIN dbo.UC_X_Host uxh ON uxp.PropertyID = uxh.PropertyID
+                                       AND uxh.IsUniverse = 1;
+    END;
+
+    INSERT @tBucketViewPrimaryBucketView (BucketViewID, PrimaryBucketViewID)
+    SELECT BucketViewID, PrimaryBucketViewID FROM @BucketViewList;
+
+    INSERT @tProperties (PropertyID)
+    SELECT DISTINCT PropertyID FROM @PropertyList
+    UNION ALL
+    SELECT uxp.PropertyID
+    FROM dbo.UC_X_Property AS uxp
+      INNER JOIN dbo.UC_X_Host uxh ON uxp.PropertyID = uxh.PropertyID
+                                     AND uxh.IsUniverse = 1;
+
+    INSERT @tPlayerID (PlayerID)
+    SELECT DISTINCT t.PlayerID
+    FROM
+    (
+      SELECT DISTINCT PlayerID
+      FROM #FilteredTransactions
+      UNION ALL
+      SELECT PlayerID
+      FROM @UniversalPlayerID
+    ) t;
+
+    IF EXISTS (SELECT 1 FROM @tPlayerID)
+    BEGIN
+      EXEC dbo.isp_RunningBalancePropertyWithPlayer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+        @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+        @FromDate = @FromDate, @UniversalID = -1,
+        @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+        @PromoOfferInitiatorID = @PromoOfferInitiatorID;
+
+      EXEC dbo.isp_RunningBalanceAwardOffer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+        @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+        @TillDate = @FromDate, @UniversalID = -1,
+        @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+        @PromoOfferInitiatorID = @PromoOfferInitiatorID;
+    END;
+
+    SET @SQL = 'CREATE NONCLUSTERED INDEX '
+               + 'nc_FinalMaxPropertyPlayerBalance_'
+               + CAST(REPLACE(NEWID(), '-', '_') AS varchar(64))
+               + '
+    ON #FinalMaxPropertyPlayerBalance(PlayerID,PrimaryBucketViewID,PropertyID) INCLUDE (MaxPropertyBalance)';
+    EXECUTE sys.sp_executesql @Stmt = @SQL;
+    SET @SQL = NULL;
+
+    SET @SQL = 'CREATE NONCLUSTERED INDEX '
+               + 'nc_FinalOfferAwardBalancesProperty_'
+               + CAST(REPLACE(NEWID(), '-', '_') AS varchar(64))
+               + '
+    ON #FinalOfferAwardBalancesProperty(PlayerID,PrimaryBucketViewID,PropertyID) INCLUDE (RunningBalance)';
+    EXECUTE sys.sp_executesql @Stmt = @SQL;
+
+    INSERT #BalBef (PlayerID, PrimaryBucketViewID, BeginningBalance)
+    SELECT PlayerID, PrimaryBucketViewID, SUM(MaxPropertyBalance)
+    FROM #FinalMaxPropertyPlayerBalance
+    GROUP BY PlayerID, PrimaryBucketViewID;
+
+    SELECT final.Property, P.UniversalPlayerID, P.FirstName, P.LastName,
+      final.TransactionDateTime, final.BucketName, final.EGMID,
+      final.BalanceBefore, final.FactoredLoyaltyPoints, final.BalanceAfter,
+      final.DollarAmountofPoints, final.CasinoManagementSystemAmount,
+      @BlankMoneyValue PromoBefore, @BlankMoneyValue CurrentPromoBalance,
+      @BlankMoneyValue PromoAfter, final.SequenceNumber, final.DataPrecision,
+      final.Symbol, final.ConversionSymbol, final.[Source],
+      IIF(final.FactoredLoyaltyPoints < 0, final.FactoredLoyaltyPoints, 0) TotalIn,
+      IIF(final.FactoredLoyaltyPoints > 0, final.FactoredLoyaltyPoints, 0) TotalOut
+    FROM
+    (
+      SELECT egm2.Property,
+        CONVERT(datetime2, egm2.TransactionDTO AT TIME ZONE @TimeZone) TransactionDateTime,
+        egm2.BucketName, egm2.EGMID,
+        ISNULL(FOA.RunningBalance, @BlankMoneyValue)
+        + ISNULL(bb.BeginningBalance, @BlankMoneyValue)
+        + ISNULL(
+                  SUM(egm2.BucketAmount) OVER (PARTITION BY egm2.PlayerID,
+                                                egm2.PrimaryBucketViewID
+                                              ORDER BY egm2.TransactionDTO
+                                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                             ),
+                  @BlankMoneyValue
+                ) BalanceBefore, egm2.FactoredLoyaltyPoints,
+        ISNULL(FOA.RunningBalance, @BlankMoneyValue)
+        + ISNULL(bb.BeginningBalance, @BlankMoneyValue)
+        + ISNULL(
+                  SUM(egm2.BucketAmount) OVER (PARTITION BY egm2.PlayerID,
+                                                egm2.PrimaryBucketViewID
+                                              ORDER BY egm2.TransactionDTO
+                                              ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                             ),
+                  @BlankMoneyValue
+                ) + egm2.BucketAmount BalanceAfter, egm2.DollarAmountofPoints,
+        egm2.CasinoManagementSystemAmount, egm2.SequenceNumber,
+        egm2.DataPrecision, egm2.Symbol, egm2.ConversionSymbol, egm2.[Source],
+        egm2.PlayerID, egm2.TransactionTypeID, egm2.InterfaceID
+      FROM
+      (
+        SELECT egm.Property, egm.TransactionDTO, egm.BucketName, egm.EGMID,
+          egm.PlayerID, egm.EarnedPropertyID,
+          SUM(egm.BucketAmount) BucketAmount, egm.PrimaryBucketViewID,
+          ISNULL(SUM(egm.BucketAmount), @BlankMoneyValue) FactoredLoyaltyPoints,
+          SUM(egm.BucketAmount) * egm.ConversionRate * (-1) DollarAmountofPoints,
+          SUM(egm.TransactionBucketAmount) * (-1) CasinoManagementSystemAmount,
+          egm.SequenceNumber, egm.DataPrecision, egm.Symbol,
+          egm.ConversionSymbol, egm.[Source], egm.InterfaceID,
+          egm.TransactionTypeID
+        FROM
+        (
+          SELECT t.BucketViewID, p.PropertyName Property,
+            p.PropertyID EarnedPropertyID, t.InterfaceID, t.TransactionTypeID,
+            bv.PrimaryBucketViewDisplayName BucketName, t.MachineID EGMID,
+            ISNULL(
+                    IIF(
+                      ISNULL(lu.BucketAmount, @BlankMoneyValue) = @BlankMoneyValue,
+                      ls.BucketAmount,
+                      lu.BucketAmount),
+                    @BlankMoneyValue
+                  ) BucketAmount,
+            ISNULL(
+                    IIF(
+                      ISNULL(lu.BucketAmount, @BlankMoneyValue) = @BlankMoneyValue,
+                      ls.TransactionAmount,
+                      lu.TransactionAmount),
+                    @BlankMoneyValue
+                  ) TransactionBucketAmount, bv.ConversionRate,
+            t.TransactionDTO, t.TransactionID SequenceNumber,
+            bv.CurrencySymbol Symbol,
+            bv.ConversionCurrencySymbol ConversionSymbol, bv.DataPrecision,
+            t.PlayerID, bv.PrimaryBucketViewID,
+            IIF(tisource.DisplayName IN ('Awards', 'Offers'),
+              tisource.DisplayName,
+              'Bucket') AS [Source],
+            ROW_NUMBER() OVER (PARTITION BY t.TransactionID,
+                                 ISNULL(
+                                       lu.TransactionLedgerID,
+                                       ls.TransactionLedgerID
+                                       )
+                               ORDER BY IIF(
+                                          ISNULL(
+                                                lu.PropertyGroupID,
+                                                t.PropertyGroupID
+                                                ) = ft.TransactionPropertyGroupID,
+                                          1,
+                                          2)
+                              ) RNumLedger
+          FROM EB.Transactions t WITH (NOLOCK)
+            INNER JOIN #FilteredTransactions ft ON ft.TransactionID = t.TransactionID
+            INNER JOIN dbo.UC_X_Property p ON t.TransactionPropertyID = p.PropertyID
+            INNER JOIN @BucketViewList bv ON bv.BucketViewID = t.BucketViewID
+            LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                              AND ls.UsageTransactionID IS NULL
+            LEFT JOIN EB.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+            LEFT JOIN dbo.TransactionInitiators tisource ON lu.TransactionInitiatorID = tisource.TransactionInitiatorID
+          WHERE t.BucketViewID <> @PromoBucketViewID
+        ) egm
+        WHERE egm.RNumLedger = 1
+        GROUP BY egm.Property, egm.BucketName, egm.EGMID, egm.TransactionDTO,
+          egm.InterfaceID, egm.TransactionTypeID, egm.PlayerID,
+          egm.PrimaryBucketViewID, egm.SequenceNumber, egm.DataPrecision,
+          egm.Symbol, egm.ConversionSymbol, egm.[Source], egm.ConversionRate,
+          egm.EarnedPropertyID
+      ) egm2
+        LEFT JOIN #BalBef bb ON bb.BalBefID > 0
+                               AND egm2.PlayerID = bb.PlayerID
+                               AND egm2.PrimaryBucketViewID = bb.PrimaryBucketViewID
+        LEFT JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = egm2.PlayerID
+                                                         AND FOA.PrimaryBucketViewID = egm2.PrimaryBucketViewID
+                                                         AND FOA.PropertyID = egm2.EarnedPropertyID
+      WHERE egm2.BucketAmount <> @BlankMoneyValue
+    ) final
+      INNER JOIN dbo.UC_PL_Player P ON P.PlayerID = final.PlayerID
+    WHERE final.InterfaceID = @EGMInterfaceID
+      AND final.TransactionTypeID IN (@NCEPInTransactionTypeID,
+                                     @CEPInTransactionTypeID
+                                     )
+    UNION ALL
+
+        SELECT final.Property, P.UniversalPlayerID, P.FirstName, P.LastName,
+      final.TransactionDateTime, final.BucketName, final.EGMID,
+      @BlankMoneyValue BalanceBefore, @BlankMoneyValue FactoredLoyaltyPoints,
+      @BlankMoneyValue BalanceAfter, @BlankMoneyValue DollarAmountofPoints,
+      @BlankMoneyValue CasinoManagementSystemAmount, final.PromoBefore,
+      final.BucketAmount CurrentPromoBalance, final.PromoAfter,
+      final.SequenceNumber, final.DataPrecision, final.Symbol,
+      final.ConversionSymbol, final.[Source],
+      IIF(final.BucketAmount < 0, final.BucketAmount, 0) TotalIn,
+      IIF(final.BucketAmount > 0, final.BucketAmount, 0) TotalIn
+    FROM
+    (
+      SELECT egm2.Property,
+        CONVERT(datetime2, egm2.TransactionDTO AT TIME ZONE @TimeZone) TransactionDateTime,
+        egm2.BucketName, egm2.EGMID, egm2.SequenceNumber, egm2.DataPrecision,
+        egm2.Symbol, egm2.ConversionSymbol, egm2.[Source], egm2.BucketAmount,
+        ISNULL(FOA.RunningBalance, @BlankMoneyValue)
+        + ISNULL(f.MaxPropertyBalance, @BlankMoneyValue)
+        + ISNULL(
+                  SUM(IIF(
+                        egm2.PropertyGroupID = 0
+                           AND egm2.PBTPromoMethod = 'U',
+                        egm2.BucketAmount,
+                        @BlankMoneyValue)
+                     ) OVER (PARTITION BY egm2.PlayerID,
+                               egm2.PrimaryBucketViewID
+                             ORDER BY egm2.TransactionDTO
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                            ),
+                  @BlankMoneyValue
+                )
+        + ISNULL(
+                  SUM(IIF(egm2.PropertyGroupID <> 0,
+                     egm2.BucketAmount,
+                     @BlankMoneyValue)
+                     ) OVER (PARTITION BY egm2.PlayerID,
+                               egm2.PrimaryBucketViewID
+                             ORDER BY egm2.TransactionDTO
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                            ),
+                  @BlankMoneyValue
+                ) PromoBefore,
+        ISNULL(FOA.RunningBalance, @BlankMoneyValue)
+        + ISNULL(f.MaxPropertyBalance, @BlankMoneyValue)
+        + ISNULL(
+                  SUM(IIF(
+                        egm2.PropertyGroupID = 0
+                           AND egm2.PBTPromoMethod = 'U',
+                        egm2.BucketAmount,
+                        @BlankMoneyValue)
+                     ) OVER (PARTITION BY egm2.PlayerID,
+                               egm2.PrimaryBucketViewID
+                             ORDER BY egm2.TransactionDTO
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                            ),
+                  @BlankMoneyValue
+                )
+        + ISNULL(
+                  SUM(IIF(egm2.PropertyGroupID <> 0,
+                     egm2.BucketAmount,
+                     @BlankMoneyValue)
+                     ) OVER (PARTITION BY egm2.PlayerID,
+                               egm2.PrimaryBucketViewID
+                             ORDER BY egm2.TransactionDTO
+                             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                            ),
+                  @BlankMoneyValue
+                ) + egm2.BucketAmount PromoAfter, egm2.PlayerID,
+        egm2.InterfaceID, egm2.TransactionTypeID
+      FROM
+      (
+        SELECT egm.Property, egm.TransactionDTO, egm.BucketName, egm.EGMID,
+          egm.PlayerID, egm.EarnedPropertyID,
+          ISNULL(SUM(egm.BucketAmount), @BlankMoneyValue) BucketAmount,
+          egm.PrimaryBucketViewID, egm.SequenceNumber, egm.DataPrecision,
+          egm.Symbol, egm.ConversionSymbol, egm.[Source], egm.PBTPromoMethod,
+          egm.PropertyGroupID, egm.InterfaceID, egm.TransactionTypeID
+        FROM
+        (
+          SELECT p.PropertyName Property, p.PropertyID EarnedPropertyID,
+            t.InterfaceID, t.TransactionTypeID,
+            bv.PrimaryBucketViewDisplayName BucketName, t.MachineID EGMID,
+            ISNULL(
+                    IIF(
+                      ISNULL(lu.BucketAmount, @BlankMoneyValue) = @BlankMoneyValue,
+                      ls.BucketAmount,
+                      lu.BucketAmount),
+                    @BlankMoneyValue
+                  ) BucketAmount, bv.ConversionRate, t.TransactionDTO,
+            t.TransactionID SequenceNumber, bv.CurrencySymbol Symbol,
+            bv.ConversionCurrencySymbol ConversionSymbol, bv.DataPrecision,
+            t.PlayerID, bv.PrimaryBucketViewID, p.PBTPromoMethod,
+            ISNULL(lu.PropertyGroupID, t.PropertyGroupID) PropertyGroupID,
+            IIF(tisource.DisplayName IN ('Awards', 'Offers'),
+              tisource.DisplayName,
+              'Bucket') AS [Source],
+            ROW_NUMBER() OVER (PARTITION BY t.TransactionID,
+                                 ISNULL(
+                                       lu.TransactionLedgerID,
+                                       ls.TransactionLedgerID
+                                       )
+                               ORDER BY IIF(
+                                          ISNULL(
+                                                lu.PropertyGroupID,
+                                                t.PropertyGroupID
+                                                ) = ft.TransactionPropertyGroupID,
+                                          1,
+                                          2)
+                              ) RNumLedger           FROM EB.Transactions t WITH (NOLOCK)
+            INNER JOIN #FilteredTransactions ft ON ft.TransactionID = t.TransactionID
+            INNER JOIN dbo.UC_X_Property p ON t.TransactionPropertyID = p.PropertyID
+            INNER JOIN @BucketViewList bv ON bv.BucketViewID = t.BucketViewID
+            LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                              AND ls.UsageTransactionID IS NULL
+            LEFT JOIN EB.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+            LEFT JOIN dbo.TransactionInitiators tisource ON lu.TransactionInitiatorID = tisource.TransactionInitiatorID
+          WHERE t.BucketViewID = @PromoBucketViewID
+        ) egm
+        WHERE egm.RNumLedger = 1
+        GROUP BY egm.Property, egm.BucketName, egm.EGMID, egm.TransactionDTO,
+          egm.PBTPromoMethod, egm.InterfaceID, egm.TransactionTypeID,
+          egm.PropertyGroupID, egm.PlayerID, egm.PrimaryBucketViewID,
+          egm.SequenceNumber, egm.DataPrecision, egm.Symbol,
+          egm.ConversionSymbol, egm.[Source], egm.EarnedPropertyID
+      ) egm2
+        LEFT JOIN #FinalMaxPropertyPlayerBalance F ON F.PlayerID = egm2.PlayerId
+                                                     AND F.PrimaryBucketViewID = egm2.PrimaryBucketViewID
+                                                     AND F.PropertyID = egm2.EarnedPropertyID
+        LEFT JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = egm2.PlayerID
+                                                         AND FOA.PrimaryBucketViewID = egm2.PrimaryBucketViewID
+                                                         AND FOA.PropertyID = egm2.EarnedPropertyID
+      WHERE egm2.BucketAmount <> @BlankMoneyValue
+    ) final
+      INNER JOIN dbo.UC_PL_Player P ON P.PlayerID = final.PlayerID
+    WHERE final.InterfaceID = @EGMInterfaceID
+      AND final.TransactionTypeID IN (@NCEPInTransactionTypeID,
+                                     @CEPInTransactionTypeID
+                                     )
+    UNION ALL
+    SELECT NULL Property, pl.UniversalPlayerID, pl.FirstName, pl.LastName,
+      NULL TransactionDateTime, bv.PrimaryBucketViewDisplayName BucketName,
+      NULL EGMID, ISNULL(SUM(bbal.MaxPropertyBalance), 0) BalanceBefore,
+      0 FactoredLoyaltyPoints,
+      ISNULL(SUM(bbal.MaxPropertyBalance), 0) BalanceAfter,
+      0 DollarAmountofPoints, 0 CasinoManagementSystemAmount,
+      ISNULL(
+              IIF(bv.PrimaryBucketViewID = @PromoBucketViewID,
+                SUM(bbal.MaxPropertyBalance),
+                0),
+              0
+            ) PromoBefore, 0 CurrentPromoBalance,
+      ISNULL(
+              IIF(bv.PrimaryBucketViewID = @PromoBucketViewID,
+                SUM(bbal.MaxPropertyBalance),
+                0),
+              0
+            ) PromoAfter, NULL SequenceNumber, bv.DataPrecision,
+      bv.CurrencySymbol Symbol, bv.ConversionCurrencySymbol ConversionSymbol,
+      NULL [Source], 0 TotalIn, 0 TotalOut
+    FROM @UniversalPlayerID up
+      INNER JOIN dbo.UC_PL_Player pl WITH (NOLOCK) ON pl.PlayerID = up.PlayerID
+      LEFT JOIN dbo.UC_PL_DomProp dp WITH (NOLOCK) ON dp.PlayerID = up.PlayerID
+      LEFT JOIN dbo.UC_X_Property dprop ON dp.DominantProperty = dprop.PropertyID
+      CROSS APPLY
+    (
+      SELECT DISTINCT PrimaryBucketViewID, PrimaryBucketViewDisplayName,
+        CurrencySymbol, ConversionCurrencySymbol, DataPrecision
+      FROM @BucketViewList
+    ) bv
+      LEFT JOIN #FilteredTransactions ft ON ft.PlayerID = up.PlayerID
+                                           AND ft.TransactionTypeID IN (
+                                                                       @NCEPInTransactionTypeID,
+                                                                       @CEPInTransactionTypeID
+                                                                       )
+      LEFT JOIN #FinalMaxPropertyPlayerBalance bbal ON up.PlayerID = bbal.PlayerID
+                                                      AND bbal.PrimaryBucketViewID = bv.PrimaryBucketViewID
+                                                      AND bbal.PropertyID = dp.DominantProperty
+    WHERE ft.PlayerID IS NULL
+    GROUP BY pl.UniversalPlayerID, pl.LastName, pl.FirstName,
+      bv.PrimaryBucketViewDisplayName, bv.CurrencySymbol,
+      bv.ConversionCurrencySymbol, dprop.PropertyName, bv.DataPrecision,
+      bv.PrimaryBucketViewID
+    OPTION (RECOMPILE);
+
+  END TRY
+  BEGIN CATCH
+    THROW;
+  END CATCH;
+END;
+GO
+------STARTING NEW SP------
+
+
+
+CREATE OR ALTER PROCEDURE dbo.usp_UC_RPT_DiscretionaryCompTransaction
+  @BucketID nvarchar(MAX) = NULL, @PropertyID nvarchar(MAX) = NULL,
+  @UniversalID nvarchar(MAX) = NULL, @UserId nvarchar(MAX) = NULL,
+  @POSNumber nvarchar(MAX) = NULL, @Fromdate date, @ToDate date,
+  @TZ nvarchar(8)
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  BEGIN TRY
+    DECLARE @propertyList table (PropertyId bigint PRIMARY KEY);
+    DECLARE @Player table (PlayerID bigint NOT NULL PRIMARY KEY);
+    DECLARE @UserList table (UserId integer NOT NULL PRIMARY KEY);
+    DECLARE @POSList table (POSNumber nvarchar(500) NOT NULL PRIMARY KEY);
+
+    DECLARE @TimeZone nvarchar(64), @IssueInitiatorStatusID tinyint,
+      @RedeemInitiatorStatusID tinyint, @VoidInitiatorStatusID tinyint,
+      @ExpiredInitiatorStatusID tinyint, @OverRideTypeID tinyint;
+
+    SELECT @IssueInitiatorStatusID = IIF(StatusDescription = 'Issue',
+                                       TransactionInitiatorStatusID,
+                                       @IssueInitiatorStatusID),
+      @RedeemInitiatorStatusID = IIF(StatusDescription = 'Redeem',
+                                   TransactionInitiatorStatusID,
+                                   @RedeemInitiatorStatusID),
+      @VoidInitiatorStatusID = IIF(StatusDescription = 'Void',
+                                 TransactionInitiatorStatusID,
+                                 @VoidInitiatorStatusID),
+      @ExpiredInitiatorStatusID = IIF(StatusDescription = 'Expired',
+                                    TransactionInitiatorStatusID,
+                                    @ExpiredInitiatorStatusID)
+    FROM dbo.TransactionInitiatorStatus;
+
+    SELECT @OverRideTypeID = OverrideTypeId
+    FROM dbo.UC_X_OverrideType
+    WHERE OverrideType = 'Issue Comp';
+
+    DECLARE @BucketViewList table
+    (
+      BucketViewID bigint NOT NULL PRIMARY KEY,
+      PrimaryBucketViewID bigint NULL,
+      BucketViewDisplayName nvarchar(512),
+      CurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL
+    );
+
+    IF @PropertyID IS NULL
+    BEGIN
+      INSERT @propertyList (PropertyId)
+      SELECT p.PropertyID
+      FROM dbo.UC_X_Property p
+        INNER JOIN dbo.UC_X_Host h ON (p.PropertyID = h.PropertyID)
+      WHERE p.Active = 1
+        AND h.IsUniverse = 0;
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO @propertyList (PropertyId)
+      SELECT value FROM STRING_SPLIT(@PropertyID, ',');
+    END;
+
+    IF @UniversalID IS NOT NULL
+    BEGIN
+      INSERT INTO @Player (PlayerID)
+      SELECT p.PlayerID
+      FROM STRING_SPLIT(@UniversalID, ',') u
+        INNER JOIN dbo.UC_PL_Player p ON p.UniversalPlayerID = u.value;
+    END;
+
+    INSERT INTO @UserList (UserId) SELECT value FROM STRING_SPLIT(@UserId, ',');
+
+    INSERT INTO @POSList (POSNumber)
+    SELECT value FROM STRING_SPLIT(@POSNumber, ',')WHERE ISNUMERIC(Value) = 1;
+
+    INSERT INTO @BucketViewList
+    (
+      BucketViewID, PrimaryBucketViewID, BucketViewDisplayName, CurrencySymbol,
+      DataPrecision
+    )
+    SELECT UBVFR.BucketViewID, UBVFR.PrimaryBucketViewID,
+      bv.BucketViewDisplayName, c.Symbol, b.DataPrecision
+    FROM dbo.udf_BucketViewsForReports(@BucketID, 'DiscretionaryComp') AS UBVFR
+      INNER JOIN dbo.BucketViews bv ON UBVFR.PrimaryBucketViewID = bv.BucketViewID
+      INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.PrimaryBucketViewID = bvb.BucketViewID
+                                             AND bvb.IsPrimaryEarningBucket = 1
+      INNER JOIN dbo.Buckets b ON b.BucketID = bvb.BucketID
+      LEFT JOIN dbo.Currencies c ON b.CurrencyID = c.CurrencyID;
+
+    SELECT @TimeZone = UXT.StandardName
+    FROM dbo.UC_X_Timezones AS UXT
+    WHERE UXT.StandardAbbreviation = @TZ
+      OR UXT.DaylightAbbreviation = @TZ;
+
+    IF @TimeZone IS NULL
+      SELECT @TimeZone = UXP.TimeZone
+      FROM dbo.UC_X_Property AS UXP
+        INNER JOIN dbo.UC_X_Host h ON UXP.PropertyID = h.PropertyID
+      WHERE h.IsUniverse = 1;
+
+    SELECT MAX(P.PropertyName) AS Property,
+      PL.UniversalPlayerID AS UniversalID, PL.LastName, PL.FirstName,
+      MAX(dbo.fn_ConvertDTOToLocalDatetime(tcr.IssueDTO, @Timezone)) AS IssueDateTime,
+      ABS(SUM( CASE
+                 WHEN
+                 (
+                   TMP.ParentTransactionID = TMP.TransactionID
+                   AND TMP.TransactionInitiatorStatusID = @RedeemInitiatorStatusID
+                 ) THEN TMP.RedeemAmount
+                 ELSE TMP.IssueAmount
+               END
+             )
+         ) AS AmountIssued,
+      MAX(TRY_CONVERT(money, lg.OriginalValue)) AS ProposedAmount,
+      MAX(ot.OutletName) AS Outlet, MAX(c.CompName) AS ItemDescription,
+      BL.BucketViewDisplayName AS Bucket,
+      MIN(IIF(
+            TMP.TransactionInitiatorStatusID IN (@IssueInitiatorStatusID,
+                                                @RedeemInitiatorStatusID
+                                                ),
+            lg.Comments,
+            NULL)
+         ) AS Reason, MAX(tcr.CompNumber) AS POSCheckNumber,
+      MIN(IIF(
+            TMP.TransactionInitiatorStatusID IN (@IssueInitiatorStatusID,
+                                                @RedeemInitiatorStatusID
+                                                ),
+            u.UserName,
+            NULL)
+         ) AS UserName, MAX(PR.PropertyName) AS IssuerProperty,
+      MAX(dbo.fn_ConvertDTOToLocalDatetime(
+                                          (pp.LastPlayedDate AT TIME ZONE pr.TimeZone),
+                                          @TimeZone
+                                          )
+         ) AS LastPlayDateTime,
+      MAX(IIF(TMP.TransactionInitiatorStatusID = @VoidInitiatorStatusID,
+            dbo.fn_ConvertDTOToLocalDatetime(t.TransactionDTO, @Timezone),
+            NULL)
+         ) VoidedDateTime,
+      MAX(
+         IIF(T.TransactionInitiatorStatusID = @VoidInitiatorStatusID,
+         u.UserName,
+         NULL)
+         ) AS VoidedUser,
+      MAX(IIF(TMP.TransactionInitiatorStatusID = @RedeemInitiatorStatusID,
+            dbo.fn_ConvertDTOToLocalDatetime(t.TransactionDTO, @Timezone),
+            NULL)
+         ) RedeemedDateTime, MAX(tcr.CompTransID) AS DCompNumber,
+      ((ISNULL(SUM(TMP.IssueAmount), 0.0) + SUM(TMP.RedeemAmount)) * (-1))
+      - ISNULL(SUM(tmp.VoidedAmount), 0) AS ActualRedeemedAmount,       SUM(TMP.VoidedAmount) AS VoidedAmount,
+      BL.CurrencySymbol AS CurrencySymbol, BL.DataPrecision,
+      ISNULL(MAX(ot1.outletName), MAX(ot.OutletName)) RedeemedOutlet
+    FROM
+    (
+      SELECT a.ParentTransactionID, a.TransactionID, a.IssueAmount,
+        a.RedeemAmount, a.VoidedAmount, a.TransactionInitiatorStatusID
+      FROM
+      (
+        SELECT ISNULL(t.ParentTransactionID, t.TransactionID) ParentTransactionID,
+          ISNULL(tl.UsageTransactionID, t.TransactionID) TransactionID,
+          ISNULL(
+                  SUM(IIF(
+                        t.TransactionInitiatorStatusID = @IssueInitiatorStatusID,
+                        ISNULL(tl.BucketAmount, 0.0),
+                        NULL)
+                     ),
+                  0
+                ) IssueAmount,
+          SUM(IIF(t.TransactionInitiatorStatusID = @RedeemInitiatorStatusID,
+                ISNULL(tl.BucketAmount, 0),
+                NULL)
+             ) RedeemAmount,
+          SUM(IIF(t.TransactionInitiatorStatusID = @VoidInitiatorStatusID,
+                ISNULL(tl.BucketAmount, 0),
+                NULL)
+             ) VoidedAmount, t.TransactionInitiatorStatusID
+        FROM EB.Transactions t WITH (NOLOCK)
+          INNER JOIN @BucketViewList BL ON BL.BucketViewID = t.BucketViewID
+          INNER JOIN dbo.PropertyGroupList pgl ON pgl.PropertyGroupID = t.PropertyGroupID
+          INNER JOIN @propertyList PRL ON PRL.PropertyId = pgl.PropertyID
+          LEFT JOIN EB.TransactionLedger tl WITH (NOLOCK) ON t.TransactionID = tl.UsageTransactionID
+          LEFT JOIN @Player Pl ON Pl.PlayerID = t.PlayerID
+        WHERE t.GamingDate >= @Fromdate
+          AND t.GamingDate <= @ToDate
+          AND (@UniversalID IS NULL OR Pl.PlayerID IS NOT NULL)
+        GROUP BY ISNULL(t.ParentTransactionID, t.TransactionID),
+          ISNULL(tl.UsageTransactionID, t.TransactionID),
+          t.TransactionInitiatorStatusID
+      ) a
+      WHERE a.TransactionInitiatorStatusID <> @ExpiredInitiatorStatusID
+    ) TMP
+      INNER JOIN EB.Transactions T WITH (NOLOCK) ON TMP.TransactionID = T.TransactionID
+      INNER JOIN @BucketViewList BL ON T.BucketViewID = BL.BucketViewID
+      INNER JOIN dbo.UC_PL_Player PL WITH (NOLOCK) ON t.PlayerID = PL.PlayerID
+      INNER JOIN dbo.PropertyGroupList pgl ON pgl.PropertyGroupID = t.PropertyGroupID
+      INNER JOIN dbo.UC_X_Property p ON p.PropertyID = pgl.PropertyID
+      INNER JOIN dbo.UC_X_Property pr ON t.TransactionPropertyID = pr.PropertyID
+      INNER JOIN @propertyList PRL ON PRL.PropertyId = p.PropertyID
+      INNER JOIN EB.TransactionCompReferences tcr WITH (NOLOCK) ON TMP.ParentTransactionID = tcr.TransactionID
+      LEFT JOIN dbo.UC_X_UserLogin u ON T.UserID = u.UserID
+      LEFT JOIN dbo.UC_X_CompItem c WITH (NOLOCK) ON c.CompItemID = tcr.CompItemID
+      LEFT JOIN dbo.UC_X_Outlet ot WITH (NOLOCK) ON ot.OutletID = c.OutletID
+      LEFT JOIN dbo.UC_L_OverrideLog lg WITH (NOLOCK) ON T.TransactionID = lg.TransactionID
+                                                        AND T.PlayerID = lg.PlayerId
+                                                        AND lg.OverrideTypeId = @OverRideTypeID
+      LEFT JOIN @UserList Userlist ON u.UserID = Userlist.UserId
+      LEFT JOIN @POSList posl ON tcr.CompTransID = posl.POSNumber
+      LEFT JOIN EB.TransactionReferences tr WITH (NOLOCK) ON tr.TransactionID = t.TransactionID
+                                                            AND tr.OutletID IS NOT NULL
+      LEFT JOIN dbo.UC_X_Outlet ot1 ON ot1.OutletID = tr.OutletID
+      OUTER APPLY
+    (
+      SELECT MAX(pp.LastPlayedDate) AS LastPlayedDate
+      FROM dbo.UC_PL_PropPlay pp
+      WHERE PL.PlayerID = pp.PlayerID
+    ) pp
+    WHERE (@UserId IS NULL OR u.UserID = Userlist.UserId)
+      AND (@POSNumber IS NULL OR posl.POSNumber IS NOT NULL)
+    GROUP BY T.PlayerID, T.BucketViewID, TMP.ParentTransactionID,
+      PL.UniversalPlayerID, PL.LastName, PL.FirstName,
+      BL.BucketViewDisplayName, BL.CurrencySymbol, BL.DataPrecision
+    OPTION (RECOMPILE);
+  END TRY
+  BEGIN CATCH
+    THROW;
+  END CATCH;
+END;
+GO
+------STARTING NEW SP------
+
+CREATE OR ALTER PROCEDURE dbo.usp_UC_RPT_PatronBalanceDetails
+(
+  @UniversalPlayerID varchar(1024) = NULL, @StartDate date = NULL,
+  @EndDate date = NULL, @PropertyIDs varchar(512) = NULL,
+  @BucketViewIDs varchar(512) = NULL, @TransactionTypes varchar(512) = NULL,
+  @TZ nvarchar(8) = NULL
+)
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  BEGIN TRY
+    DECLARE @Timezone nvarchar(64), 
+      @tBucketViewPrimaryBucketView AS dbo.tBucketViewPrimaryBucketView,
+      @tProperties AS dbo.tProperties, @tPlayerID AS dbo.tPlayerID,
+      @PromoBucketViewID smallint, @BucketAwardInitiatorID smallint,
+      @PromoOfferInitiatorID smallint, @SQL nvarchar(MAX),
+      @IssueTransactionInitiatorStatusID tinyint,
+      @VoidTransactionInitiatorStatusID tinyint, @IsVoidTransactionType bit,
+      @ExpiredTransactionTypeID smallint,
+      @RolloverTransactionInitiatorStatusID tinyint,
+      @PurgeTransactionInitiatorStatusID tinyint,
+      @RecoveredInitiatorStatusID tinyint, @PromoBucketViewName varchar(512);
+
+    DECLARE @UniversalIDList TABLE (UniversalID varchar(12) PRIMARY KEY, PlayerID bigint NULL);
+
+    DECLARE @TransactionTypeList table
+    (
+      TransactionTypeID bigint NOT NULL PRIMARY KEY,
+      TransactionType varchar(32) NOT NULL
+    );
+    DECLARE @PropertyList TABLE (PropertyID bigint PRIMARY KEY);
+    DECLARE @AllTransactionTypes table
+    (
+      TransactionTypeID bigint NOT NULL PRIMARY KEY,
+      DisplayTransactiontype nvarchar(100) NOT NULL,
+      TransactionType varchar(32) NOT NULL,
+      Source varchar(30) NOT NULL
+    );
+    DECLARE @BucketViewList TABLE
+    (
+      BucketViewID bigint NOT NULL PRIMARY KEY,
+      PrimaryBucketViewID bigint NOT NULL,
+      BucketViewDisplayName nvarchar(256) NULL,
+      IsComp bit NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL,
+      BucketName nvarchar(256) NOT NULL,
+      IsDefaultBucketView bit NULL,
+      BucketType nvarchar(64) NOT null
+    );
+
+    SELECT @IssueTransactionInitiatorStatusID = IIF(StatusDescription = 'Issue',
+                                                  TransactionInitiatorStatusID,
+                                                  @IssueTransactionInitiatorStatusID),
+      @VoidTransactionInitiatorStatusID = IIF(StatusDescription = 'Void',
+                                            TransactionInitiatorStatusID,
+                                            @VoidTransactionInitiatorStatusID),
+      @RolloverTransactionInitiatorStatusID = IIF(
+                                                StatusDescription = 'Rollover',
+                                                TransactionInitiatorStatusID,
+                                                @RolloverTransactionInitiatorStatusID),
+      @PurgeTransactionInitiatorStatusID = IIF(StatusDescription = 'Purge',
+                                             TransactionInitiatorStatusID,
+                                             @PurgeTransactionInitiatorStatusID),
+      @RecoveredInitiatorStatusID = IIF(StatusDescription = 'Recovered',
+                                             TransactionInitiatorStatusID,
+                                             @RecoveredInitiatorStatusID)
+    FROM dbo.TransactionInitiatorStatus
+    WHERE StatusDescription IN ('Issue', 'Void', 'Rollover', 'Purge', 'Recovered');
+
+    SELECT @BucketAwardInitiatorID = IIF(Name = 'BucketAwards',
+                                     TransactionInitiatorID,
+                                     @BucketAwardInitiatorID),
+      @PromoOfferInitiatorID = IIF(Name = 'PromoOffer',
+                               TransactionInitiatorID,
+                               @PromoOfferInitiatorID)
+    FROM dbo.TransactionInitiators
+    WHERE Name IN ('BucketAwards', 'PromoOffer');
+
+    SELECT @ExpiredTransactionTypeID = TransactionTypeID
+    FROM dbo.TransactionTypes
+    WHERE name = 'Expired';
+
+    DROP TABLE IF EXISTS #FinalMaxPropertyPlayerBalance;
+    CREATE TABLE #FinalMaxPropertyPlayerBalance
+    (
+      PrimaryBucketViewID bigint NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      PropertyName varchar(50) NOT NULL,
+      MaxPropertyBalance money NOT NULL
+    );
+
+    DROP TABLE IF EXISTS #FinalOfferAwardBalancesProperty;
+    CREATE TABLE #FinalOfferAwardBalancesProperty
+    (
+      PrimaryBucketViewID int NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      RunningBalance money NULL PRIMARY KEY
+                                (PrimaryBucketViewID, PlayerID, PropertyID)
+    );
+
+    CREATE TABLE #ResultSet
+    (
+      ID bigint NULL,
+      PropertyName varchar(50) NULL,
+      TransactionType nvarchar(32) NULL,
+      TransactionDate datetime2 NULL,
+      MachineID int NULL,
+      BucketName nvarchar(256) NULL,
+      TransAmount money NULL,
+      PriorBalance money NULL,
+      PlayerID char(12) NULL,
+      AfterBalance money NULL,
+      ExternalTransaction nvarchar(128) NULL,
+      DataPrecision tinyint NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      BucketType nvarchar(64) NULL,
+      PrimaryBucketViewDisplayName nvarchar(256) NULL
+    );
+
+    SELECT @PromoBucketViewID = BV.BucketViewID
+    FROM dbo.BucketSettings BS
+      INNER JOIN dbo.BucketSettingsConfig BSC ON BSC.BucketSettingID = BS.BucketSettingID
+      INNER JOIN dbo.BucketViewBuckets BVB ON BVB.BucketID = BS.BucketID
+      INNER JOIN dbo.BucketViews BV ON BV.BucketViewID = BVB.BucketViewID
+    WHERE BSC.SettingKey = 'IsFreePlay'
+      AND BS.Value = 1;
+
+    INSERT INTO @BucketViewList
+    (
+      BucketViewID, PrimaryBucketViewID, BucketViewDisplayName, CurrencySymbol,
+      DataPrecision, BucketName, IsDefaultBucketView, BucketType
+    )
+    SELECT UBVFR.BucketViewID, UBVFR.PrimaryBucketViewID,
+      bvp.BucketViewDisplayName, b1.Symbol, b1.DataPrecision, b.BucketName,
+      bv.IsDefaultBucketView, bt.BucketTypeName
+    FROM dbo.udf_BucketViewsForReports(
+                                        @BucketViewIDs,
+                                        'CompItems,IsTierPoints,IsFreePlay,DiscretionaryComp,IsRedeemableAtEGM,ConsolidatedBucket'
+                                      ) AS UBVFR
+      INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.BucketViewID = bvb.BucketViewID
+                                             AND bvb.IsPrimaryEarningBucket = 1
+      INNER JOIN dbo.BucketViews bv ON bvb.BucketViewID = bv.BucketViewID
+      INNER JOIN dbo.BucketViews bvp ON bvp.BucketViewID = UBVFR.PrimaryBucketViewID
+      INNER JOIN dbo.Buckets b ON b.BucketID = bvb.BucketID
+      INNER JOIN dbo.BucketTypes bt ON bt.BucketTypeID = b.BucketTypeID
+      CROSS APPLY
+    (
+      SELECT bkt.DataPrecision, c.Symbol
+      FROM dbo.Buckets bkt
+        INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.PrimaryBucketViewID = bvb.BucketViewID
+                                               AND bvb.IsPrimaryEarningBucket = 1
+        LEFT JOIN dbo.Currencies c ON bkt.CurrencyID = c.CurrencyID
+      WHERE bkt.BucketID = bvb.BucketID
+    ) b1;
+
+    SELECT @PromoBucketViewName = BucketViewDisplayName 
+    FROM @bucketviewList WHERE BucketName ='Universal Promo';
+
+    INSERT @AllTransactionTypes (TransactionTypeID, DisplayTransactiontype,
+                                TransactionType, Source
+                                )
+    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) TransactionSourceID,
+      DisplayTransactiontype, TransactionType, Source
+    FROM
+    (
+      SELECT CASE
+               WHEN Name IN ('NCEPIn', 'CEPIN') THEN 'Download'
+               WHEN Name = 'NCEPOut' THEN 'Upload'
+               ELSE Name
+             END AS DisplayTransactiontype, Name AS TransactionType,
+        'TransactionTypes' AS Source
+      FROM dbo.TransactionTypes
+      WHERE Name IN ('Adjustment', 'Redeem', 'Earning', 'NCEPIn', 'CEPIn',
+                      'NCEPOut', 'Expired', 'Reward', 'Deposit'
+                    )
+      UNION ALL
+      SELECT StatusDescription DisplayTransactiontype,
+        StatusDescription TransactionType, 'InitiatorStatus' AS Source
+      FROM dbo.TransactionInitiatorStatus
+      WHERE StatusDescription IN ('Issue', 'Active', 'Void', 'Return',
+                                 'Rollover', 'Purge'
+                                 )
+    ) a;
+
+    IF (@TransactionTypes IS NOT NULL)
+    BEGIN
+      INSERT @TransactionTypeList (TransactionTypeID, TransactionType)
+      SELECT att.TransactionTypeID, att.TransactionType
+      FROM STRING_SPLIT(@TransactionTypes, ',') tt
+        INNER JOIN @AllTransactionTypes att ON att.DisplayTransactiontype = tt.value;
+    END;
+    ELSE
+    BEGIN
+      INSERT @TransactionTypeList (TransactionTypeID, TransactionType)
+      SELECT TransactionTypeID, TransactionType FROM @AllTransactionTypes;
+    END;
+
+    IF @UniversalPlayerID IS NOT NULL
+    BEGIN
+      INSERT INTO @UniversalIDList
+      SELECT a.value, upp.playerid
+      FROM STRING_SPLIT(@UniversalPlayerID, ',') a
+        INNER JOIN dbo.UC_PL_Player upp WITH (NOLOCK) ON a.value = upp.UniversalPlayerID;
+    END;
+
+    IF @PropertyIDs IS NULL
+    BEGIN
+      INSERT INTO @PropertyList
+      SELECT p.PropertyID FROM dbo.UC_X_Property p WHERE P.Active = 1;
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO @PropertyList
+      SELECT p.value
+      FROM STRING_SPLIT(@PropertyIDs, ',') p
+        INNER JOIN dbo.UC_X_Property pr ON CAST(p.value AS bigint) = pr.PropertyID
+                                          AND pr.Active = 1;
+    END;
+
+    INSERT INTO @tBucketViewPrimaryBucketView (BucketViewID,
+                                              PrimaryBucketViewID
+                                              )
+    SELECT BucketViewID, PrimaryBucketViewID FROM @BucketViewList;
+
+    INSERT INTO @tProperties (PropertyID)
+    SELECT PropertyID FROM @PropertyList
+    UNION ALL
+    SELECT H.PropertyID
+    FROM dbo.UC_X_Property P
+      INNER JOIN dbo.UC_X_Host H ON H.PropertyID = P.PropertyID
+    WHERE H.IsUniverse = 1;
+
+    IF (@UniversalPlayerID IS NOT NULL)
+    BEGIN
+      INSERT INTO @tPlayerID (PlayerID) SELECT PlayerID FROM @UniversalIDList;
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO @tPlayerID
+      SELECT DISTINCT T.PlayerID
+      FROM EB.Transactions T WITH (NOLOCK)
+        INNER JOIN dbo.TransactionTypes tt ON tt.TransactionTypeID = t.TransactionTypeID
+        INNER JOIN @BucketViewList BVL ON BVL.BucketViewID = T.BucketViewID
+        INNER JOIN @PropertyList PL ON PL.PropertyID = T.TransactionPropertyID
+        LEFT JOIN @UniversalIDList UIL ON UIL.PlayerID = T.PlayerID
+        LEFT JOIN dbo.TransactionInitiatorStatus TIS ON TIS.TransactionInitiatorStatusID = t.TransactionInitiatorStatusID
+                                                       AND TIS.TransactionInitiatorStatusID IN (@IssueTransactionInitiatorStatusID,
+                                                                                                 @VoidTransactionInitiatorStatusID,
+                                                                                                 @RolloverTransactionInitiatorStatusID,
+                                                                                                 @PurgeTransactionInitiatorStatusID
+                                                                                               )
+        INNER JOIN @TransactionTypeList ttl ON ttl.TransactionType = IIF(
+                                                                       tis.TransactionInitiatorStatusID IS NOT NULL
+                                                                          AND @IsVoidTransactionType = 1,
+                                                                       tis.StatusDescription,
+                                                                       tt.Name)
+      WHERE T.GamingDate BETWEEN @StartDate AND @EndDate
+        AND (@UniversalPlayerID IS NULL OR UIL.PlayerID = T.PlayerID);
+    END;
+
+    SELECT @TimeZone = UXT.StandardName
+    FROM dbo.UC_X_Timezones AS uxt
+    WHERE UXT.StandardAbbreviation = @TZ
+      OR UXT.DaylightAbbreviation = @TZ;
+
+    IF @TimeZone IS NULL
+      SELECT @TimeZone = uxp.TimeZone
+      FROM dbo.UC_X_Property AS uxp
+        INNER JOIN dbo.uc_x_host uxh ON uxp.PropertyID = uxh.PropertyID
+                                       AND uxh.isuniverse = 1;
+
+    IF EXISTS (SELECT 1 FROM @tPlayerID)
+    BEGIN
+      EXEC dbo.isp_RunningBalancePropertyWithPlayer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+        @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+        @FromDate = @StartDate, @UniversalID = -1,
+        @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+        @PromoOfferInitiatorID = @PromoOfferInitiatorID;
+
+      EXEC dbo.isp_RunningBalanceAwardOffer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+        @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+        @PromoOfferInitiatorID = @PromoOfferInitiatorID,
+        @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+        @TillDate = @StartDate, @UniversalID = -1;
+    END;
+
+    SET @SQL = 'CREATE NONCLUSTERED INDEX '
+               + 'nc_FinalMaxPropertyPlayerBalance_'
+               + CAST(REPLACE(NEWID(), '-', '_') AS varchar(64))
+               + ' 
+    ON #FinalMaxPropertyPlayerBalance(PlayerID,PrimaryBucketViewID,PropertyID) INCLUDE (MaxPropertyBalance)';
+
+    EXECUTE sys.sp_executesql @Stmt = @SQL;
+    SET @SQL = NULL;
+
+    IF EXISTS (SELECT 1 FROM @BucketViewList WHERE BucketViewID = @PromoBucketViewID)
+    BEGIN
+      INSERT INTO #ResultSet
+      (
+        ID, PropertyName, TransactionType, TransactionDate, MachineID,
+        BucketName, TransAmount, PriorBalance, PlayerID, AfterBalance,
+        ExternalTransaction, DataPrecision, CurrencySymbol, BucketType,
+        PrimaryBucketViewDisplayName
+      )
+      SELECT a.TransactionID AS ID, a.Property AS PropertyName,
+        a.TransactionType, a.TransactionDateTime AS TransactionDate,
+        a.MachineID, a.Bucket AS BucketName,
+        ISNULL(AmountofTransaction, 0) AS TransAmount,
+        BeginningBalance AS PriorBalance, a.UniversalPlayerID AS PlayerID,
+        (BeginningBalance + ISNULL(AmountofTransaction, 0)) AS AfterBalance,
+        a.ExternalTransaction, a.DataPrecision, a.CurrencySymbol, a.BucketType,
+        a.PrimaryBucketViewDisplayName
+      FROM
+      (
+        SELECT t.Bucket, t.PrimaryBucketViewDisplayName, t.Property,
+          t.UniversalPlayerID,
+          CASE
+            WHEN t.TransactionType = 'Void' THEN 'Void'
+            WHEN att.TransactionType = N'Redeem'
+              AND t.TransactionInitiatorStatusID IS NOT NULL THEN
+              tis.StatusDescription
+            WHEN t.TransactionInitiatorStatusID = @VoidTransactionInitiatorStatusID THEN 'Void'
+            WHEN t.TransactionInitiatorStatusID = @RecoveredInitiatorStatusID THEN 'Recovered'
+            ELSE att.DisplayTransactiontype
+          END TransactionType, t.TransactionDateTime,
+          ISNULL(FOA.RunningBalance, 0.00) + ISNULL(F.MaxPropertyBalance, 0.00)
+          + ISNULL(T.PromoRunningBalance, 0.0)
+          + ISNULL(T.BeginningBalanceAward, 0.0) BeginningBalance,
+          SUM(T.BucketAmount) OVER (PARTITION BY T.TransactionID, T.RNumLedger ORDER BY T.TransactionID) AmountofTransaction,
+          t.TransactionID, t.CurrencySymbol, t.DataPrecision, t.MachineID,
+          t.ExternalTransaction, T.BucketType,
+          ROW_NUMBER() OVER (PARTITION BY T.TransactionID, T.RNumLedger
+ORDER BY T.RNumLedger, T.LedgerID
+                            ) RNum
+        FROM
+        (
+          SELECT IIF(
+                   t.BucketViewDisplayName <> t.BucketName
+                      AND t.IsDefaultBucketView = 1,
+                   t.BucketViewDisplayName + '- ' + t.BucketName,
+                   t.BucketViewDisplayName) AS Bucket,
+            t.BucketViewDisplayName AS PrimaryBucketViewDisplayName,
+            pr.PropertyName Property, p.UniversalPlayerID,
+            CONVERT(datetime2, tr.TransactionDTO AT TIME ZONE @TimeZone) TransactionDateTime,
+            t.TransactionID, t.CurrencySymbol, t.DataPrecision,
+            IIF(t.TransactionType IS NULL, 'No Activity', t.TransactionType) TransactionType,
+            ISNULL(
+                    SUM(IIF(
+                          ISNULL(PGLU.PropertyGroupID, PGL.PropertyGroupID) = 0
+                             AND pr.PBTPromoMethod = 'U'
+                             AND ISNULL(
+                                       TU.TransactionInitiatorID,
+                                       TR.TransactionInitiatorID
+                                       ) NOT IN (@BucketAwardInitiatorID,
+                                                @PromoOfferInitiatorID
+                                                ),
+                          ISNULL(lu.BucketAmount, ls.BucketAmount),
+                          0.0)
+                       ) OVER (PARTITION BY TR.PlayerID, T.PrimaryBucketViewID
+                               ORDER BY TR.TransactionDTO,PGL.PropertyGroupID, TR.TransactionID
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                              ),
+                    0.0
+                  )
+            + ISNULL(
+                      SUM(IIF(
+                            ISNULL(PGLU.PropertyGroupID, PGL.PropertyGroupID) <> 0
+                               AND ISNULL(
+                                         TU.TransactionInitiatorID,
+                                         TR.TransactionInitiatorID
+                                         ) NOT IN (@BucketAwardInitiatorID,
+                                                  @PromoOfferInitiatorID
+                                                  ),
+                            ISNULL(lu.BucketAmount, ls.BucketAmount),
+                            0.0)
+                         ) OVER (PARTITION BY tr.PlayerID,
+                                   T.PrimaryBucketViewID, t.EarnedPropertyID
+                                 ORDER BY ISNULL(
+                                                lu.TransactionLedgerID,
+                                                ls.TransactionLedgerID
+                                                ), TR.TransactionDTO,
+                                   TR.TransactionID
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                ),
+                      0.0
+                    ) AS PromoRunningBalance,
+            SUM(IIF(
+                  ISNULL(TU.TransactionInitiatorID, TR.TransactionInitiatorID) IN (
+                                                                                  @BucketAwardInitiatorID,
+                                                                                  @PromoOfferInitiatorID
+                                                                                  ),
+                  ISNULL(lu.BucketAmount, ls.BucketAmount),
+                  0.00)
+               ) OVER (PARTITION BY TR.PlayerID, T.PrimaryBucketViewID,
+                         IIF(
+                           ISNULL(
+                                         TU.TransactionInitiatorID,
+                                         TR.TransactionInitiatorID
+                                         ) IN (@BucketAwardInitiatorID,
+                                              @PromoOfferInitiatorID
+                                              ),
+                           ISNULL(PGLU.PropertyID, PGL.PropertyID),
+                           TR.TransactionPropertyID)
+                       ORDER BY ISNULL(
+                                              lu.TransactionLedgerID,
+                                              ls.TransactionLedgerID
+                                              ), TR.TransactionDTO,
+                         TR.TransactionID
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ) BeginningBalanceAward,
+            ROW_NUMBER() OVER (PARTITION BY TR.TransactionID,
+                                 ISNULL(
+                                       lu.TransactionLedgerID,
+                                       ls.TransactionLedgerID
+                                       )
+                               ORDER BY IIF(
+                                        ISNULL(PGLU.PropertyID, PGL.PropertyID) = TR.TransactionPropertyID,
+                                        1,
+                                        2)
+                              ) RNumLedger,             ISNULL(lu.BucketAmount, ls.BucketAmount) BucketAmount, p.PlayerID,
+            t.PrimaryBucketViewID, t.EarnedPropertyID, TR.MachineID,
+            t.ExternalTransaction, T.BucketType,
+            btt.Name AS VoidTransactionType, t.TransactionInitiatorStatusID,
+            ISNULL(lu.TransactionLedgerID, ls.TransactionLedgerID) LedgerID
+          FROM
+          (
+            SELECT t.TransactionID, bvl.PrimaryBucketViewID, t.GamingDate,
+              t.TransactionPropertyID EarnedPropertyID, bvl.CurrencySymbol,
+              bvl.DataPrecision, bvl.BucketViewDisplayName, bvl.BucketName,
+              bvl.IsDefaultBucketView,
+              CASE
+                WHEN tt.Name = N'Expired'
+                  AND t.TransactionInitiatorStatusID = @PurgeTransactionInitiatorStatusID THEN
+                  'Purge'
+                WHEN tt.Name = N'Adjustment'
+                  AND t.TransactionInitiatorStatusID = @RolloverTransactionInitiatorStatusID THEN
+                  'Rollover'
+                ELSE tt.Name
+              END AS TransactionType, tr.ExternalID ExternalTransaction,
+              bvl.BucketType, t.TransactionInitiatorStatusID
+            FROM EB.Transactions t WITH (NOLOCK)
+              INNER JOIN dbo.TransactionTypes tt ON tt.TransactionTypeID = t.TransactionTypeID
+              INNER JOIN @bucketviewList bvl ON t.BucketViewID = bvl.BucketViewID
+              INNER JOIN @tPlayerID ul ON ul.PlayerID = t.PlayerID
+              LEFT JOIN EB.TransactionReferences tr ON tr.TransactionID = t.TransactionID
+            WHERE (t.GamingDate >= @StartDate AND t.GamingDate <= @EndDate)
+          ) t
+            INNER JOIN EB.Transactions TR WITH (NOLOCK) ON TR.TransactionID = t.TransactionID
+            INNER JOIN dbo.PropertyGroupList PGL ON PGL.PropertyGroupID = TR.PropertyGroupID
+            INNER JOIN dbo.UC_X_Property pr ON IIF(tr.PropertyGroupID = 0,
+                                               tr.TransactionPropertyID,
+                                               pgl.PropertyID) = pr.PropertyID
+            INNER JOIN dbo.UC_PL_Player p ON TR.PlayerID = p.PlayerID
+            LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                              AND ls.UsageTransactionID IS NULL
+            LEFT JOIN eb.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+            LEFT JOIN EB.Transactions TU WITH (NOLOCK) ON lu.SourceTransactionID = tu.TransactionID
+            LEFT JOIN dbo.PropertyGroupList PGLU ON PGLU.PropertyGroupID = TU.PropertyGroupID
+                                                   AND TR.TransactionTypeID <> @ExpiredTransactionTypeID
+            LEFT JOIN EB.TransactionOfferReferences tor WITH (NOLOCK) ON t.transactionid = tor.TransactionID
+                                                                        AND tor.TransactionID > 0
+            LEFT JOIN dbo.TransactionTypes btt ON btt.TransactionTypeID = tu.TransactionTypeID
+                                                 AND t.TransactionType = 'Void'
+        ) T
+          INNER JOIN @PropertyList PRL ON PRL.PropertyID = t.EarnedPropertyID
+          LEFT JOIN @TransactionTypeList tt ON t.TransactionType = tt.Transactiontype
+          LEFT JOIN @TransactionTypeList ttVoid ON t.VoidTransactionType = ttVoid.Transactiontype
+          INNER JOIN @AllTransactionTypes att ON ISNULL(
+                                                       tt.TransactionType,
+                                                       ttVoid.TransactionType
+                                                       ) = att.TransactionType
+          LEFT JOIN dbo.TransactionInitiatorStatus tis ON tis.TransactionInitiatorStatusID = T.TransactionInitiatorStatusID
+          LEFT JOIN #FinalMaxPropertyPlayerBalance F ON F.PlayerID = T.PlayerId
+                                                       AND F.PrimaryBucketViewID = t.PrimaryBucketViewID
+                                                       AND F.PropertyID = T.EarnedPropertyID
+          LEFT JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = T.PlayerID
+                                                           AND FOA.PrimaryBucketViewID = t.PrimaryBucketViewID
+                                                           AND FOA.PropertyID = T.EarnedPropertyID
+        WHERE (tt.TransactionType IS NOT NULL OR ttVoid.TransactionType IS NOT NULL)
+          AND T.RNumLedger = 1
+      ) a
+      WHERE a.RNum = 1
+      OPTION (RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+      DROP TABLE IF EXISTS #BalBef;
+      CREATE TABLE #BalBef
+      (
+        BalBefID int IDENTITY(1, 1) PRIMARY KEY,
+        MaxPropertyBalance money NULL,
+        PlayerID bigint NOT NULL,
+        PrimaryBucketViewID smallint NOT NULL
+      );
+
+      INSERT INTO #BalBef (PlayerID, PrimaryBucketViewID, MaxPropertyBalance)
+      SELECT PlayerID, PrimaryBucketViewID, SUM(MaxPropertyBalance)
+      FROM #FinalMaxPropertyPlayerBalance
+      GROUP BY PlayerID, PrimaryBucketViewID;
+
+      INSERT INTO #ResultSet
+      (
+        ID, PropertyName, TransactionType, TransactionDate, MachineID,
+        BucketName, TransAmount, PriorBalance, PlayerID, AfterBalance,
+        ExternalTransaction, DataPrecision, CurrencySymbol, BucketType,
+        PrimaryBucketViewDisplayName
+      )
+      SELECT a.TransactionID AS ID, a.Property AS PropertyName,
+        a.TransactionType, a.TransactionDateTime AS TransactionDate,
+        a.MachineID, a.Bucket AS BucketName,
+        ISNULL(a.AmountofTransaction, 0)
+        + IIF(TransactionType = 'Redeem',
+            IIF(ISNULL(a.AmountofTransaction, 0.0) >= 0,
+              ISNULL(AmountIssued, 0.0),
+              0.0),
+            0.0) AS TransAmount, a.BeginningBalance AS PriorBalance,
+        a.UniversalPlayerID AS PlayerID,
+        (a.BeginningBalance + ISNULL(a.AmountofTransaction, 0)) AS AfterBalance,
+        a.ExternalTransaction, a.DataPrecision, a.CurrencySymbol, a.BucketType,
+        a.PrimaryBucketViewDisplayName
+      FROM
+      (
+        SELECT t.Bucket, t.PrimaryBucketViewDisplayName, t.Property,
+          t.UniversalPlayerID, t.TransactionDateTime,
+          CASE
+            WHEN t.TransactionType = 'Void' THEN 'Void'
+            WHEN att.TransactionType = N'Redeem'
+              AND t.TransactionInitiatorStatusID IS NOT NULL THEN
+              tis.StatusDescription
+            WHEN t.TransactionInitiatorStatusID = @VoidTransactionInitiatorStatusID THEN 'Void'
+            WHEN t.TransactionInitiatorStatusID = @RecoveredInitiatorStatusID THEN 'Recovered'
+            ELSE att.DisplayTransactiontype
+          END TransactionType,
+          ISNULL(FOA.RunningBalance, 0.00) + ISNULL(F.MaxPropertyBalance, 0.00)
+          + ISNULL(T.RunningBeginningBalanceBucket, 0.0)
+          + ISNULL(T.RunningBeginningBalanceAward, 0.0) AS BeginningBalance,
+          SUM(T.BucketAmount) OVER (PARTITION BY T.TransactionID, T.RNumLedger ORDER BY T.TransactionID) AmountofTransaction,
+          t.TransactionID, t.CurrencySymbol, t.DataPrecision, t.MachineID,
+          t.ExternalTransaction, T.BucketType,
+          ROW_NUMBER() OVER (PARTITION BY T.TransactionID, T.RNumLedger
+ORDER BY T.RNumLedger, T.LedgerID
+                            ) RNum, T.AmountIssued
+        FROM
+        (
+          SELECT IIF(
+                   t.BucketViewDisplayName <> t.BucketName
+                      AND t.IsDefaultBucketView = 1,
+                   t.BucketViewDisplayName + '- ' + t.BucketName,
+                   t.BucketViewDisplayName) AS Bucket,
+            t.BucketViewDisplayName AS PrimaryBucketViewDisplayName,
+            pr.PropertyName Property, p.UniversalPlayerID,
+            CONVERT(datetime2, tr.TransactionDTO AT TIME ZONE @TimeZone) TransactionDateTime,
+            t.TransactionID, t.CurrencySymbol, t.DataPrecision,
+            IIF(t.TransactionType IS NULL, 'No Activity', t.Transactiontype) TransactionType,
+            SUM(IIF(
+                  ISNULL(TU.TransactionInitiatorID, TR.TransactionInitiatorID) <> @BucketAwardInitiatorID,
+                  ISNULL(lu.BucketAmount, ls.BucketAmount),
+                  0.00)
+               ) OVER (PARTITION BY TR.PlayerID, T.PrimaryBucketViewID
+                       ORDER BY ISNULL(
+                                              lu.TransactionLedgerID,
+                                              ls.TransactionLedgerID
+                                              ), TR.TransactionDTO,
+                         TR.TransactionID
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ) RunningBeginningBalanceBucket,
+            SUM(IIF(
+                  ISNULL(TU.TransactionInitiatorID, TR.TransactionInitiatorID) = @BucketAwardInitiatorID,
+                  ISNULL(lu.BucketAmount, ls.BucketAmount),
+                  0.00)
+               ) OVER (PARTITION BY TR.PlayerID, T.PrimaryBucketViewID,
+                         IIF(
+                           ISNULL(
+                                         TU.TransactionInitiatorID,
+                                         TR.TransactionInitiatorID
+                                         ) = @BucketAwardInitiatorID,
+                           ISNULL(PGLU.PropertyID, PGL.PropertyID),
+                           TR.TransactionPropertyID)
+                       ORDER BY ISNULL(
+                                              lu.TransactionLedgerID,
+                                              ls.TransactionLedgerID
+                                              ), TR.TransactionDTO,
+                         TR.TransactionID
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ) RunningBeginningBalanceAward,
+            ROW_NUMBER() OVER (PARTITION BY TR.TransactionID,
+                                 ISNULL(
+                                       lu.TransactionLedgerID,
+                                       ls.TransactionLedgerID
+                                       )
+                               ORDER BY IIF(
+                                        ISNULL(PGLU.PropertyID, PGL.PropertyID) = TR.TransactionPropertyID,
+                                        1,
+                                        2)
+                              ) RNumLedger,             ISNULL(lu.BucketAmount, ls.BucketAmount) BucketAmount, p.PlayerID,
+            t.PrimaryBucketViewID, t.EarnedPropertyID, TR.MachineID,
+            t.ExternalTransaction, T.BucketType,
+            btt.Name AS VoidTransactionType, t.TransactionInitiatorStatusID,
+            ISNULL(tp.Amount, 0.0) AmountIssued,
+            ISNULL(lu.TransactionLedgerID, ls.TransactionLedgerID) LedgerID
+          FROM
+          (
+            SELECT t.TransactionID, bvl.PrimaryBucketViewID, t.GamingDate,
+              t.TransactionPropertyID EarnedPropertyID, bvl.CurrencySymbol,
+              bvl.DataPrecision, bvl.BucketViewDisplayName, bvl.BucketName,
+              bvl.IsDefaultBucketView,
+              CASE
+                WHEN tt.Name = N'Expired'
+                  AND t.TransactionInitiatorStatusID = @PurgeTransactionInitiatorStatusID THEN
+                  'Purge'
+                WHEN tt.Name = N'Adjustment'
+                  AND t.TransactionInitiatorStatusID = @RolloverTransactionInitiatorStatusID THEN
+                  'Rollover'
+                ELSE tt.Name
+              END AS TransactionType, tr.ExternalID ExternalTransaction,
+              bvl.BucketType, tis.TransactionInitiatorStatusID
+            FROM EB.Transactions t WITH (NOLOCK)
+              INNER JOIN dbo.TransactionTypes tt ON tt.TransactionTypeID = t.TransactionTypeID
+              INNER JOIN @bucketviewList bvl ON t.BucketViewID = bvl.BucketViewID
+              INNER JOIN @tPlayerID ul ON ul.PlayerID = t.PlayerID
+              LEFT JOIN EB.TransactionReferences tr ON tr.TransactionID = t.TransactionID
+              LEFT JOIN dbo.TransactionInitiatorStatus tis ON tis.TransactionInitiatorStatusID = t.TransactionInitiatorStatusID
+            WHERE (t.GamingDate >= @StartDate AND t.GamingDate <= @EndDate)
+          ) t
+            INNER JOIN EB.Transactions TR WITH (NOLOCK) ON TR.TransactionID = t.TransactionID
+            INNER JOIN dbo.PropertyGroupList PGL ON PGL.PropertyGroupID = TR.PropertyGroupID
+            INNER JOIN dbo.UC_X_Property pr ON pgl.PropertyID = pr.PropertyID
+            INNER JOIN dbo.UC_PL_Player p ON TR.PlayerID = p.PlayerID
+            LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                              AND ls.UsageTransactionID IS NULL
+            LEFT JOIN eb.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+            LEFT JOIN EB.Transactions TU WITH (NOLOCK) ON lu.SourceTransactionID = tu.TransactionID
+            LEFT JOIN EB.Transactions tp WITH (NOLOCK) ON tp.TransactionID = TR.ParentTransactionID
+            LEFT JOIN dbo.PropertyGroupList PGLU ON PGLU.PropertyGroupID = TU.PropertyGroupID
+                                                   AND TR.TransactionTypeID <> @ExpiredTransactionTypeID
+            LEFT JOIN dbo.TransactionTypes btt ON btt.TransactionTypeID = tu.TransactionTypeID
+                                                 AND t.TransactionType = 'Void'
+        ) T
+          INNER JOIN @PropertyList PRL ON PRL.PropertyID = t.EarnedPropertyID
+          LEFT JOIN @TransactionTypeList tt ON t.TransactionType = tt.Transactiontype
+          LEFT JOIN @TransactionTypeList ttVoid ON t.VoidTransactionType = ttVoid.Transactiontype
+          INNER JOIN @AllTransactionTypes att ON ISNULL(
+                                                       tt.TransactionType,
+                                                       ttVoid.TransactionType
+                                                       ) = att.TransactionType
+          LEFT JOIN dbo.TransactionInitiatorStatus tis ON tis.TransactionInitiatorStatusID = T.TransactionInitiatorStatusID
+          LEFT JOIN #BalBef F ON F.PlayerID = T.PlayerId
+                                AND F.PrimaryBucketViewID = t.PrimaryBucketViewID
+          LEFT JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = T.PlayerID
+                                                           AND FOA.PrimaryBucketViewID = t.PrimaryBucketViewID
+                                                           AND FOA.PropertyID = T.EarnedPropertyID
+        WHERE (tt.TransactionType IS NOT NULL OR ttVoid.TransactionType IS NOT NULL)
+          AND T.RNumLedger = 1
+      ) a
+      WHERE a.RNum = 1
+      OPTION (RECOMPILE);
+    END;
+    IF EXISTS (SELECT 1 FROM #ResultSet)
+    BEGIN
+      IF EXISTS (SELECT 1 FROM #ResultSet WHERE TransactionType IN ('Purge','Recovered') AND PrimaryBucketViewDisplayName = @PromoBucketViewName)
+      BEGIN 
+
+        SELECT ID, PropertyName, TransactionType, TransactionDate, MachineID,
+          BucketName, TransAmount, PriorBalance, PlayerID, AfterBalance,
+          ExternalTransaction, DataPrecision, CurrencySymbol, BucketType,
+          PrimaryBucketViewDisplayName
+        FROM #ResultSet
+          ORDER BY TransactionDate ASC,
+            CASE  WHEN  TransactionType = 'Purge' THEN PriorBalance ELSE NULL END DESC ,
+            CASE  WHEN  TransactionType = 'Recovered' THEN AfterBalance ELSE NULL END ASC
+
+      END
+      ELSE 
+      BEGIN 
+        SELECT ID, PropertyName, TransactionType, TransactionDate, MachineID,
+            BucketName, TransAmount, PriorBalance, PlayerID, AfterBalance,
+            ExternalTransaction, DataPrecision, CurrencySymbol, BucketType,
+            PrimaryBucketViewDisplayName
+         FROM #ResultSet
+       END 
+      END;
+
+    ELSE
+    BEGIN
+      SELECT NULL ID, NULL PropertyName, NULL TransactionType,
+        NULL AS TransactionDate, NULL MachineID,
+        bv.BucketViewDisplayName AS BucketName, 0 TransAmount,
+        (ISNULL(bbal.MaxPropertyBalance, 0) + ISNULL(FOA.RunningBalance, 0)) PriorBalance,
+        p.UniversalPlayerID AS PlayerID,
+        (ISNULL(bbal.MaxPropertyBalance, 0) + ISNULL(FOA.RunningBalance, 0)) AS AfterBalance,
+        NULL ExternalTransaction, bv.DataPrecision, bv.CurrencySymbol,
+        NULL BucketType, bv.BucketViewDisplayName
+      FROM @UniversalIDList up
+        INNER JOIN dbo.UC_PL_Player P WITH (NOLOCK) ON up.PlayerID = P.PlayerID
+        LEFT JOIN dbo.UC_PL_DomProp dp WITH (NOLOCK) ON dp.PlayerID = P.PlayerID
+        LEFT JOIN dbo.UC_X_Property dprop ON dp.DominantProperty = dprop.PropertyID
+        CROSS APPLY
+      (
+        SELECT DISTINCT PrimaryBucketViewID, BucketViewDisplayName,
+          CurrencySymbol, DataPrecision
+        FROM @BucketViewList
+      ) bv
+        LEFT JOIN #FinalMaxPropertyPlayerBalance bbal ON P.PlayerID = bbal.PlayerID
+                                                        AND bbal.PrimaryBucketViewID = bv.PrimaryBucketViewID
+                                                        AND bbal.PropertyID = dp.DominantProperty
+        FULL OUTER JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = bbal.PlayerID
+                                                               AND FOA.PrimaryBucketViewID = bbal.PrimaryBucketViewID
+                                                               AND FOA.PropertyID = bbal.PropertyID;
+    END;
+  END TRY
+  BEGIN CATCH
+    THROW;
+  END CATCH;
+END;
+GO
+------STARTING NEW SP------
+
+
+CREATE OR ALTER PROCEDURE dbo.usp_UC_RPT_PlayerEnrollmentDetail
+  @FromDate datetime, @ToDate datetime, @PlayerID varchar(MAX) = NULL,
+  @PropertyID varchar(MAX) = NULL, @CreatedBy varchar(MAX) = NULL,
+  @TZ nvarchar(8)
+AS
+BEGIN
+  SET NOCOUNT ON;
+  BEGIN TRY
+
+    DECLARE @PropertyTable TABLE (ID bigint PRIMARY KEY);
+    DECLARE @UserTable TABLE (CreatedBy varchar(30) PRIMARY KEY);
+    DECLARE @PlayerTable TABLE (PlayerID varchar(30) PRIMARY KEY);
+    DECLARE @UniversalTimeZone nvarchar(64), @TimeZone nvarchar(64);
+
+    IF @PropertyID IS NOT NULL
+    BEGIN
+      INSERT INTO @PropertyTable (ID)
+      SELECT [value] FROM STRING_SPLIT(@PropertyID, ',');
+    END;
+
+    IF @CreatedBy IS NOT NULL
+    BEGIN
+      INSERT INTO @UserTable (CreatedBy)
+      SELECT [value] FROM STRING_SPLIT(@CreatedBy, ',');
+    END;
+
+    IF @PlayerID IS NOT NULL
+    BEGIN
+      INSERT INTO @PlayerTable (PlayerID)
+      SELECT [value] FROM STRING_SPLIT(@PlayerID, ',');
+    END;
+
+    SELECT @TimeZone = UXT.StandardName
+    FROM dbo.UC_X_Timezones AS UXT
+    WHERE UXT.StandardAbbreviation = @TZ
+      OR UXT.DaylightAbbreviation = @TZ;
+
+    IF @TimeZone IS NULL
+      SELECT @TimeZone = UXP.TimeZone
+      FROM dbo.UC_X_Property AS UXP
+        INNER JOIN dbo.UC_X_Host h ON h.PropertyID = UXP.PropertyID
+      WHERE h.IsUniverse = 1;
+
+    SELECT @UniversalTimeZone = UXP.TimeZone
+    FROM dbo.UC_X_Property AS UXP
+      INNER JOIN dbo.UC_X_Host h ON UXP.PropertyID = h.PropertyID
+    WHERE h.IsUniverse = 1;
+
+    SELECT @FromDate = dbo.fn_ConvertDTOToLocalDatetime(
+                                                       @FromDate AT TIME ZONE @TimeZone,
+                                                       @UniversalTimeZone
+                                                       ),
+      @ToDate = dbo.fn_ConvertDTOToLocalDatetime(
+                                                @ToDate AT TIME ZONE @TimeZone,
+                                                @UniversalTimeZone
+                                                );
+
+    SELECT dbo.fn_ConvertDTOToLocalDatetime(
+                                           P.CreatedDate AT TIME ZONE @UniversalTimeZone,
+                                           @TimeZone
+                                           ) EnrolllmentDate,
+      P.UniversalPlayerID PlayerID, P.FirstName, P.LastName,
+      pro.PropertyName Property, pc.PrintCount CardPrinted,
+      P.CreatedBy EnrolledBy
+    FROM dbo.UC_PL_Player P WITH (NOLOCK)
+      INNER JOIN dbo.UC_X_Property pro WITH (NOLOCK) ON pro.PropertyID = P.EnrollmentPropertyId
+      INNER JOIN dbo.UC_X_UserLogin u WITH (NOLOCK) ON u.UserName = P.CreatedBy
+      LEFT JOIN dbo.UC_PL_Card pc WITH (NOLOCK) ON pc.PlayerID = P.PlayerID
+    WHERE p.CreatedDate >= @FromDate
+      AND p.CreatedDate <= @ToDate
+      AND
+      (
+        @PlayerID IS NULL
+        OR EXISTS (SELECT 1 FROM @PlayerTable pl WHERE P.UniversalPlayerID = pl.PlayerID)
+      )
+      AND
+      (
+        @PropertyID IS NULL
+        OR EXISTS (SELECT 1 FROM @PropertyTable pt WHERE pt.ID = P.EnrollmentPropertyId)
+      )
+      AND
+      (
+        @CreatedBy IS NULL
+        OR EXISTS (SELECT 1 FROM @UserTable ut WHERE ut.CreatedBy = u.UserID)
+      )
+    OPTION (RECOMPILE);
+
+  END TRY
+  BEGIN CATCH
+    THROW;
+  END CATCH;
+END;
+
+GO
+
+------STARTING NEW SP------
+
+CREATE OR ALTER PROCEDURE dbo.usp_UC_RPT_PlayerTransactionBalanceReport_sel
+(
+  @BucketViewID nvarchar(MAX) = NULL, @PropertyID nvarchar(MAX) = NULL,
+  @UniversalID nvarchar(MAX) = NULL, @FromDate date, @ToDate date,
+  @TZ nvarchar(7)
+)
+AS
+BEGIN
+  BEGIN TRY
+    SET NOCOUNT ON;
+
+    DECLARE @RedeemTransactionTypeID smallint, @Timezone nvarchar(64),
+      @tBucketViewPrimaryBucketView AS dbo.tBucketViewPrimaryBucketView,
+      @tProperties AS dbo.tProperties, @tPlayerID AS dbo.tPlayerID,
+      @PromoBucketViewID smallint, @BucketAwardInitiatorID smallint,
+      @PromoOfferInitiatorID smallint, @CompItemInitiatorID smallint,
+      @NonCompItemInitiatorID smallint, @SQL nvarchar(MAX),
+      @AvailableTransactionInitiatorStatusID tinyint,
+      @IssueTransactionInitiatorStatusID tinyint,
+      @VoidTransactionInitiatorStatusID tinyint, 
+      @ExpiredTransactionTypeID smallint, @EarningTransactionTypeID smallint,
+      @CEPInTransactionTypeID smallint, @NCEPInTransactionTypeID smallint,
+      @AdjustmentTransactionTypeID smallint, @CEPOutTransactionTypeID smallint,
+      @NCEPOutTransactionTypeID smallint, @DepositTransactionTypeID smallint,
+      @RewardTransactionTypeID smallint, @TierBonusInitiatorID smallint,
+      @SpeedMediaInterfaceID smallint, @MassImporterInterfaceID smallint,
+      @EGMInterfaceID smallint, @OneLinkInterfaceID smallint,
+      @KioskInterfaceID smallint, @EventBlockInitiatorID smallint,
+      @RedeemTransactionInitiatorStatusID smallint,
+      @MobilityInterfaceID smallint;
+
+    DECLARE @PropertyList TABLE (PropertyID bigint PRIMARY KEY);
+    DECLARE @UniversalIDList TABLE (UniversalID varchar(12) PRIMARY KEY, PlayerID bigint NOT NULL);
+    DECLARE @BucketViewList table
+    (
+      BucketViewID bigint NOT NULL PRIMARY KEY,
+      PrimaryBucketViewID bigint NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL,
+      BucketViewDisplayName nvarchar(256) NOT NULL,
+      PrimaryBucketViewDisplayName nvarchar(256) NOT NULL,
+      BucketName nvarchar(256) NOT NULL,
+      IsDefaultBucketView bit NOT NULL
+    );
+    CREATE TABLE #ResultSet
+    (
+      Bucket nvarchar(256) NULL,
+      Property varchar(50) NULL,
+      UniversalID char(12) NULL,
+      FirstName varchar(50) NULL,
+      LastName varchar(50) NULL,
+      GamingDate date NULL,
+      TransactionDateTime datetime2(7) NULL,
+      BeginningBalance decimal(38, 4) NULL,
+      Earned money NULL,
+      Voided money NULL,
+      EGMDownloaded money NULL,
+      Adjustments money NULL,
+      Expired money NULL,
+      ExternalRewards money NULL,
+      Prize money NULL,
+      Eventtickets money NULL,
+      BucketAward money NULL,
+      Redeemed money NULL,
+      Issued money NULL,
+      Promooffers money NULL,
+      NCEPOut money NULL,
+      SOURCE varchar(12) NULL,
+      CurrencySymbol nvarchar(3) NULL,
+      DataPrecision tinyint NULL,
+      IsIgnoreEB int NULL,
+      PartialRedeemAmount money NULL,
+      TransactionID bigint NULL
+    );
+
+    IF @PropertyID IS NULL
+    BEGIN
+      INSERT INTO @PropertyList
+      SELECT p.PropertyID FROM dbo.UC_X_Property p WHERE p.Active = 1;
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO @PropertyList SELECT value FROM STRING_SPLIT(@PropertyID, ',');
+    END;
+
+    INSERT INTO @tProperties (PropertyID)
+    SELECT PropertyID FROM @PropertyList
+    UNION ALL
+    SELECT H.PropertyID
+    FROM dbo.UC_X_Property P
+      INNER JOIN dbo.UC_X_Host H ON H.PropertyID = P.PropertyID
+    WHERE H.IsUniverse = 1;
+
+    INSERT INTO @BucketViewList
+    (
+      Bucketviewid, PrimaryBucketViewID, CurrencySymbol, DataPrecision,
+      BucketViewDisplayName, PrimaryBucketViewDisplayName, BucketName,
+      IsDefaultBucketView
+    )
+    SELECT UBVFR.BucketViewID, UBVFR.PrimaryBucketViewID, b1.Symbol,
+      b1.DataPrecision, BVP.BucketViewDisplayName,
+      pbv.BucketViewDisplayName PrimaryBucketViewDisplayName, b.BucketName,
+      bv.IsDefaultBucketView
+    FROM dbo.udf_BucketViewsForReports(
+                                        @BucketViewID,
+                                        'BalanceUsage,CompItems,ConsolidatedBucket,IsTierPoints,IsFreePlay,DiscretionaryComp,ExclusiveBucket,
+      IsRedeemableAtEGM,FunctionalAuthorization,IsNegativeBalanceAllowed,VisibleToPlayers'
+                                      ) AS UBVFR
+      INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.BucketViewID = bvb.BucketViewID
+                                             AND bvb.IsPrimaryEarningBucket = 1
+      INNER JOIN dbo.BucketViews bv ON bvb.BucketViewID = bv.BucketViewID
+      INNER JOIN dbo.BucketViews bvp ON bvp.BucketViewID = UBVFR.PrimaryBucketViewID
+      INNER JOIN dbo.Buckets b ON b.BucketID = bvb.BucketID
+      INNER JOIN dbo.BucketViews pbv ON UBVFR.PrimaryBucketViewID = pbv.BucketViewID
+      CROSS APPLY
+    (
+      SELECT bkt.DataPrecision, c.Symbol
+      FROM dbo.Buckets bkt
+        INNER JOIN dbo.BucketViewBuckets bvb ON UBVFR.PrimaryBucketViewID = bvb.BucketViewID
+                                               AND bvb.IsPrimaryEarningBucket = 1
+        LEFT JOIN dbo.Currencies c ON bkt.CurrencyID = c.CurrencyID
+      WHERE bkt.BucketID = bvb.BucketID
+    ) b1;
+
+    INSERT INTO @tBucketViewPrimaryBucketView (BucketViewID,
+                                              PrimaryBucketViewID
+                                              )
+    SELECT BucketViewID, PrimaryBucketViewID FROM @BucketViewList;
+
+    SELECT @BucketAwardInitiatorID = IIF(Name = 'BucketAwards',
+                                     TransactionInitiatorID,
+                                     @BucketAwardInitiatorID),
+      @PromoOfferInitiatorID = IIF(Name = 'PromoOffer',
+                               TransactionInitiatorID,
+                               @PromoOfferInitiatorID),
+      @TierBonusInitiatorID = IIF(Name = 'TierBonus',
+                              TransactionInitiatorID,
+                              @TierBonusInitiatorID),
+      @EventBlockInitiatorID = IIF(Name = 'EventBlock',
+                               TransactionInitiatorID,
+                               @EventBlockInitiatorID),
+      @CompItemInitiatorID = IIF(Name = 'CompItem',
+                             TransactionInitiatorID,
+                             @CompItemInitiatorID),
+      @NonCompItemInitiatorID = IIF(Name = 'NonCompItem',
+                                TransactionInitiatorID,
+                                @NonCompItemInitiatorID)
+    FROM dbo.TransactionInitiators
+    WHERE Name IN ('BucketAwards', 'PromoOffer', 'TierBonus', 'EventBlock',
+                    'CompItem', 'NonCompItem'
+                  );
+
+    SELECT @SpeedMediaInterfaceID = IIF(InterfaceName = 'SpeedMedia',
+                                    InterfaceID,
+                                    @SpeedMediaInterfaceID),
+      @EGMInterfaceID = IIF(InterfaceName = 'EGM', InterfaceID, @EGMInterfaceID),
+      @OneLinkInterfaceID = IIF(InterfaceName = 'OneLink',
+                            InterfaceID,
+                            @OneLinkInterfaceID),
+      @KioskInterfaceID = IIF(InterfaceName = 'Kiosk',
+                          InterfaceID,
+                          @KioskInterfaceID),
+      @MassImporterInterfaceID = IIF(InterfaceName = 'Mass Import',
+                                 InterfaceID,
+                                 @MassImporterInterfaceID),
+      @MobilityInterfaceID = IIF(InterfaceName = 'Mobility',
+                          InterfaceID,
+                          @MobilityInterfaceID)
+    FROM dbo.Interfaces
+    WHERE InterfaceName IN ('SpeedMedia', 'OneLink', 'Kiosk', 'EGM',
+                           'Mass Import','Mobility'
+                           );
+
+    SELECT @EarningTransactionTypeID = IIF(Name = 'Earning',
+                                       TransactionTypeID,
+                                       @EarningTransactionTypeID),
+      @AdjustmentTransactionTypeID = IIF(Name = 'Adjustment',
+                                     TransactionTypeID,
+                                     @AdjustmentTransactionTypeID),
+      @RedeemTransactionTypeID = IIF(Name = 'Redeem',
+                                 TransactionTypeID,
+                                 @RedeemTransactionTypeID),
+      @ExpiredTransactionTypeID = IIF(Name = 'Expired',
+                                  TransactionTypeID,
+                                  @ExpiredTransactionTypeID),
+      @CEPInTransactionTypeID = IIF(Name = 'CEPIn',
+                                TransactionTypeID,
+                                @CEPInTransactionTypeID),
+      @CEPOutTransactionTypeID = IIF(Name = 'CEPOut',
+                                 TransactionTypeID,
+                                 @CepOutTransactionTypeID),
+      @NCEPInTransactionTypeID = IIF(Name = 'NCEPIn',
+                                 TransactionTypeID,
+                                 @NCEPInTransactionTypeID),
+      @NCEPOutTransactionTypeID = IIF(Name = 'NCEPOut',
+                                  TransactionTypeID,
+                                  @NCEPOutTransactionTypeID),
+      @DepositTransactionTypeID = IIF(Name = 'Deposit',
+                                  TransactionTypeID,
+                                  @DepositTransactionTypeID),
+      @RewardTransactionTypeID = IIF(Name = 'Reward',
+                                 TransactionTypeID,
+                                 @RewardTransactionTypeID)
+    FROM dbo.TransactionTypes
+    WHERE Name IN ('Earning', 'Adjustment', 'Redeem', 'Expired', 'CEPIn',
+                    'CEPOut', 'NCEPIn', 'NCEPOut', 'Deposit', 'Reward'
+                  );
+
+    SELECT @IssueTransactionInitiatorStatusID = IIF(StatusDescription = 'Issue',
+                                                  TransactionInitiatorStatusID,
+                                                  @IssueTransactionInitiatorStatusID),
+      @RedeemTransactionInitiatorStatusID = IIF(StatusDescription = 'Redeem',
+                                              TransactionInitiatorStatusID,
+                                              @RedeemTransactionInitiatorStatusID),
+      @VoidTransactionInitiatorStatusID = IIF(StatusDescription = 'Void',
+                                            TransactionInitiatorStatusID,
+                                            @VoidTransactionInitiatorStatusID),
+      @AvailableTransactionInitiatorStatusID = IIF(
+                                                 StatusDescription = 'Available',
+                                                 TransactionInitiatorStatusID,
+                                                 @AvailableTransactionInitiatorStatusID)
+    FROM dbo.TransactionInitiatorStatus
+    WHERE StatusDescription IN ('Issue', 'Redeem', 'Available', 'Void');
+
+    IF @UniversalID IS NOT NULL
+    BEGIN
+      INSERT INTO @UniversalIDList
+      SELECT a.value, upp.PlayerID
+      FROM STRING_SPLIT(@UniversalID, ',') a
+        INNER JOIN dbo.UC_PL_Player upp WITH (NOLOCK) ON a.value = upp.UniversalPlayerID;
+
+      INSERT INTO @tPlayerID (PlayerID) SELECT PlayerID FROM @UniversalIDList;
+    END;
+    ELSE
+    BEGIN
+      INSERT INTO @tPlayerID
+      SELECT DISTINCT T.PlayerID
+      FROM EB.Transactions T WITH (NOLOCK)
+        INNER JOIN @BucketViewList BVL ON BVL.BucketViewID = T.BucketViewID
+        INNER JOIN @PropertyList PL ON PL.PropertyID = T.TransactionPropertyID
+        LEFT JOIN @UniversalIDList UIL ON UIL.PlayerID = T.PlayerID
+      WHERE T.GamingDate BETWEEN @FromDate AND @ToDate
+        AND (@UniversalID IS NULL OR UIL.PlayerID = T.PlayerID);
+    END;
+
+    DROP TABLE IF EXISTS #MaxPropertyPlayerBalance;
+    CREATE TABLE #MaxPropertyPlayerBalance
+    (
+      PrimaryBucketViewID bigint NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      MaxPropertyBalance money NOT NULL
+    );
+  
+  
+    UPDATE #MaxPropertyPlayerBalance
+    SET PropertyID = 100001
+
+    DROP TABLE IF EXISTS #FinalMaxPropertyPlayerBalance;
+    CREATE TABLE #FinalMaxPropertyPlayerBalance
+    (
+      PrimaryBucketViewID bigint NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      PropertyName varchar(50) NOT NULL,
+      MaxPropertyBalance money NOT NULL
+    );
+
+    DROP TABLE IF EXISTS #FinalOfferAwardBalancesProperty;
+    CREATE TABLE #FinalOfferAwardBalancesProperty
+    (
+      PrimaryBucketViewID int NOT NULL,
+      PlayerID bigint NOT NULL,
+      PropertyID bigint NOT NULL,
+      RunningBalance money NULL PRIMARY KEY
+                                (PrimaryBucketViewID, PlayerID, PropertyID)
+    );
+
+    SELECT @TimeZone = UXT.StandardName
+    FROM dbo.UC_X_Timezones AS UXT
+    WHERE UXT.StandardAbbreviation = @TZ
+      OR UXT.DaylightAbbreviation = @TZ;
+
+    SELECT @PromoBucketViewID = BV.BucketViewID
+    FROM dbo.BucketSettings BS
+      INNER JOIN dbo.BucketSettingsConfig BSC ON BSC.BucketSettingID = BS.BucketSettingID
+      INNER JOIN dbo.BucketViewBuckets BVB ON BVB.BucketID = BS.BucketID
+      INNER JOIN dbo.BucketViews BV ON BV.BucketViewID = BVB.BucketViewID
+    WHERE BSC.SettingKey = 'IsFreePlay'
+      AND BS.Value = 1;
+
+    IF @TimeZone IS NULL
+      SELECT @TimeZone = UXP.TimeZone
+      FROM dbo.UC_X_Property AS UXP
+        INNER JOIN dbo.UC_X_Host h ON uxp.PropertyID = h.PropertyID
+      WHERE h.IsUniverse = 1;
+
+    IF EXISTS (SELECT 1 FROM @tPlayerID)
+    BEGIN
+      EXEC dbo.isp_RunningBalancePropertyWithPlayer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+        @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+        @FromDate = @FromDate, @UniversalID = -1,
+        @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+        @PromoOfferInitiatorID = @PromoOfferInitiatorID;
+
+      EXEC dbo.isp_RunningBalanceAwardOffer_sel @BucketViewList = @tBucketViewPrimaryBucketView,
+        @BucketAwardInitiatorID = @BucketAwardInitiatorID,
+        @PromoOfferInitiatorID = @PromoOfferInitiatorID,
+        @PropertyList = @tProperties, @PlayerIDs = @tPlayerID,
+        @TillDate = @FromDate, @UniversalID = -1;
+    END;
+
+    SET @SQL = 'CREATE NONCLUSTERED INDEX '
+               + 'nc_FinalMaxPropertyPlayerBalance_'
+               + CAST(REPLACE(NEWID(), '-', '_') AS varchar(64))
+               + ' 
+  ON #FinalMaxPropertyPlayerBalance(PlayerID,PrimaryBucketViewID,PropertyID) INCLUDE (MaxPropertyBalance)';
+
+    EXECUTE sys.sp_executesql @Stmt = @SQL;
+    SET @SQL = NULL;
+
+    IF EXISTS (SELECT 1 FROM @BucketViewList WHERE BucketViewID = @PromoBucketViewID)
+    BEGIN
+      INSERT INTO #ResultSet
+      (
+        Bucket, Property, UniversalID, FirstName, LastName, GamingDate,
+        TransactionDateTime, BeginningBalance, Earned, Voided, EGMDownloaded,
+        Adjustments, Expired, ExternalRewards, Prize, Eventtickets,
+        BucketAward, Redeemed, Issued, Promooffers, NCEPOut, SOURCE,
+        CurrencySymbol, DataPrecision, IsIgnoreEB, PartialRedeemAmount,
+        TransactionID
+      )
+      SELECT T.Bucket, T.Property, T.UniversalPlayerID UniversalID,
+        T.FirstName, T.LastName, T.GamingDate, T.TransactionDateTime,
+        T.BeginningBalance,
+        IIF(
+          (
+            T.TransactionInitiatorID = @TierBonusInitiatorID
+            AND T.TransactionDerivedTypeID = @DepositTransactionTypeID
+          ),
+          T.AmountofTransaction,
+          0) AS Earned,
+        IIF(T.TransactionDerivedTypeID = -10, T.AmountofTransaction, 0) AS Voided,
+        IIF(
+          T.TransactionDerivedTypeID IN (@NCEPInTransactionTypeID,
+                                        @CEPInTransactionTypeID
+                                        ),
+          T.AmountofTransaction,
+          0) AS EGMDownloaded,
+        IIF(
+          T.TransactionDerivedTypeID = @AdjustmentTransactionTypeID
+             AND T.InterfaceID NOT IN (@SpeedMediaInterfaceID,
+                                      @KioskInterfaceID, @OneLinkInterfaceID,
+                                      @MobilityInterfaceID
+                                      )
+             AND ISNULL(T.TransactionInitiatorID, 0) <> @EventBlockInitiatorID,
+          T.AmountofTransaction,
+          0) AS Adjustments,
+        IIF(T.TransactionDerivedTypeID = @ExpiredTransactionTypeID,
+          T.AmountofTransaction,
+          0) AS Expired,
+        IIF(
+          T.TransactionDerivedTypeID IN (@DepositTransactionTypeID,
+                                        @RewardTransactionTypeID
+                                        )
+             AND T.InterfaceID IN (@SpeedMediaInterfaceID, @KioskInterfaceID,
+                                  @OneLinkInterfaceID, @MobilityInterfaceID
+                                  )
+             AND T.TransactionInitiatorID <> @TierBonusInitiatorID
+             AND T.TransactionDerivedTypeID <> -10
+             AND T.SOURCE = 'Bucket',
+          T.AmountofTransaction,
+          0) AS ExternalRewards,
+        IIF(
+          EXISTS
+    (
+      SELECT 1
+      FROM AWA.UC_PL_PrizeRedemptionDetail
+      WHERE t.SequenceNumber = RedeemedTransactionID
+    )
+             AND T.TransactionDerivedTypeID <> -10,
+          T.AmountofTransaction,
+          0) AS Prize,
+        IIF(
+          BlockEvents.Eventtickets IS NOT NULL
+             AND T.TransactionInitiatorID = @EventBlockInitiatorID
+             AND T.TransactionDerivedTypeID <> -10,
+          T.AmountofTransaction,
+          0) AS Eventtickets,
+        IIF(
+          T.SOURCE = 'Bucket Award'
+             AND T.TransactionInitiatorStatusID = @AvailableTransactionInitiatorStatusID,
+          T.AmountofTransaction,
+          0) AS BucketAward,
+        CASE
+          WHEN T.TransactionInitiatorID = @CompItemInitiatorID
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.ParentTransactionID IS NOT NULL THEN T.AmountofTransaction
+          WHEN T.TransactionDerivedTypeID IN (@RedeemTransactionTypeID,
+                                               @DepositTransactionTypeID,
+                                               @NCEPInTransactionTypeID,
+                                               @CEPInTransactionTypeID
+                                             )
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.TransactionInitiatorID NOT IN (@PromoOfferInitiatorID,
+                                                @EventBlockInitiatorID,
+                                                @TierBonusInitiatorID
+                                                )
+            AND T.InterfaceID NOT IN (@EGMInterfaceID)
+            AND NOT EXISTS
+    (
+      SELECT 1
+      FROM AWA.UC_PL_PrizeRedemptionDetail
+      WHERE t.SequenceNumber = RedeemedTransactionID
+    )
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID THEN
+            T.AmountofTransaction
+          ELSE 0
+        END AS Redeemed,
+        IIF(
+          T.TransactionInitiatorStatusID = @IssueTransactionInitiatorStatusID
+             AND T.TransactionInitiatorID IN (@CompItemInitiatorID,
+                                             @NonCompItemInitiatorID
+                                             )
+             AND T.TransactionDerivedTypeID NOT IN (@DepositTransactionTypeID,
+                                                     @NCEPInTransactionTypeID,
+                                                     @CEPInTransactionTypeID,
+                                                     @EventBlockInitiatorID,
+                                                     -10
+                                                   )
+             AND NOT EXISTS
+    (
+      SELECT 1
+      FROM AWA.UC_PL_PrizeRedemptionDetail
+      WHERE t.SequenceNumber = RedeemedTransactionID
+    )   ,
+          T.AmountofTransaction,
+          0) AS Issued,
+        IIF(
+          T.TransactionInitiatorID = @PromoOfferInitiatorID
+             AND T.TransactionDerivedTypeID <> -10,
+          T.AmountofTransaction,
+          0) AS Promooffers,
+        IIF(T.TransactionDerivedTypeID = @NCEPOutTransactionTypeID,
+          T.AmountofTransaction,
+          0) AS NCEPOut, T.SOURCE, T.CurrencySymbol, T.DataPrecision,
+        CASE
+          WHEN T.TransactionInitiatorID = @CompItemInitiatorID
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.ParentTransactionID IS NOT NULL
+            AND T.AmountofTransaction = 0 THEN 1
+          ELSE 0
+        END AS IsIgnoreEB,
+        CASE
+          WHEN T.TransactionInitiatorID = @CompItemInitiatorID
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.ParentTransactionID IS NOT NULL
+            AND T.AmountofTransaction IS NOT NULL THEN T.AmountofTransaction
+          ELSE 0
+        END AS PartialRedeemAmount, T.SequenceNumber AS TransactionID
+      FROM
+      (
+        SELECT T.Bucket, T.Property, T.UniversalPlayerID, T.FirstName,
+          T.LastName, t.playerID, T.TransactionDateTime,
+          ISNULL(FOA.RunningBalance, 0.00) + ISNULL(F.MaxPropertyBalance, 0.00)
+          + ISNULL(T.PromoRunningBalance, 0.0)
+          + ISNULL(T.BeginningBalanceAward, 0.0) BeginningBalance,
+          SUM(T.BucketAmount) OVER (PARTITION BY T.SequenceNumber, T.RNumLedger ORDER BY T.SequenceNumber) AmountofTransaction,
+          T.ParentTransactionID, T.RNumLedger, T.SequenceNumber,
+          T.CurrencySymbol, T.DataPrecision, T.TransactionDerivedTypeID,
+          T.EarnedPropertyID,
+          IIF(
+            LEAD(T.SequenceNumber, 1) OVER (ORDER BY T.RNumLedger) = T.SequenceNumber
+               AND LEAD(T.SOURCE, 1) OVER (ORDER BY T.RNumLedger) <> T.SOURCE,
+            'Multiple',
+            T.SOURCE) SOURCE, T.TransactionInitiatorID, T.InterfaceID,
+          T.TransactionInitiatorStatusID, T.GamingDate,
+          ROW_NUMBER() OVER (PARTITION BY T.SequenceNumber, T.RNumLedger
+ORDER BY T.RNumLedger, T.LedgerID
+                            ) RNum
+        FROM
+        (
+          SELECT t.BucketViewDisplayName AS Bucket, pr.PropertyName Property,
+            p.UniversalPlayerID, p.FirstName, p.LastName, t.GamingDate,
+            CONVERT(datetime2, tr.TransactionDTO AT TIME ZONE @TimeZone) TransactionDateTime,
+            t.TransactionID AS SequenceNumber, t.CurrencySymbol,
+            t.DataPrecision, t.TransactionDerivedTypeID,
+            CASE
+              WHEN ISNULL(lu.TransactionInitiatorID, ls.TransactionInitiatorID) = @BucketAwardInitiatorID then
+                'Bucket Award'
+              WHEN ISNULL(lu.TransactionInitiatorID, ls.TransactionInitiatorID) = @PromoOfferInitiatorID then
+                'Promo Offer'
+              ELSE 'Bucket'
+            END AS SOURCE, TR.TransactionInitiatorID,
+            ISNULL(
+                    SUM(IIF(
+                          ISNULL(PGLU.PropertyGroupID, PGL.PropertyGroupID) = 0
+                             AND pr.PBTPromoMethod = 'U'
+                             AND ISNULL(
+                                       TU.TransactionInitiatorID,
+                                       TR.TransactionInitiatorID
+                                       ) NOT IN (@BucketAwardInitiatorID,
+                                                @PromoOfferInitiatorID
+                                                ),
+                          ISNULL(lu.BucketAmount, ls.BucketAmount),
+                          0.0)
+                       ) OVER (PARTITION BY TR.PlayerID, t.PrimaryBucketViewID
+                               ORDER BY TR.TransactionDTO, TR.TransactionID
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                              ),
+                    0.0
+                  )
+            + ISNULL(
+                      SUM(IIF(
+                            ISNULL(PGLU.PropertyGroupID, PGL.PropertyGroupID) <> 0
+                               AND ISNULL(
+                                         TU.TransactionInitiatorID,
+                                         TR.TransactionInitiatorID
+                                         ) NOT IN (@BucketAwardInitiatorID,
+                                                  @PromoOfferInitiatorID
+                                                  ),
+                            ISNULL(lu.BucketAmount, ls.BucketAmount),
+                            0.0)
+                         ) OVER (PARTITION BY tr.PlayerID,
+                                   t.PrimaryBucketViewID, t.EarnedPropertyID
+                                 ORDER BY ISNULL(
+                                                lu.TransactionLedgerID,
+                                                ls.TransactionLedgerID
+                                                ), TR.TransactionDTO,
+                                   TR.TransactionID
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                                ),
+                      0.0
+                    ) AS PromoRunningBalance,
+            SUM(IIF(
+                  ISNULL(TU.TransactionInitiatorID, TR.TransactionInitiatorID) IN (
+                                                                                  @BucketAwardInitiatorID,
+                                                                                  @PromoOfferInitiatorID
+                                                                                  ),
+                  ISNULL(lu.BucketAmount, ls.BucketAmount),
+                  0.00)
+               ) OVER (PARTITION BY TR.PlayerID, t.PrimaryBucketViewID,
+                         IIF(
+                           ISNULL(
+                                         TU.TransactionInitiatorID,
+                                         TR.TransactionInitiatorID
+                                         ) IN (@BucketAwardInitiatorID,
+                                              @PromoOfferInitiatorID
+                                              ),
+                           ISNULL(PGLU.PropertyID, PGL.PropertyID),
+                           TR.TransactionPropertyID)
+                       ORDER BY ISNULL(
+                                              lu.TransactionLedgerID,
+                                              ls.TransactionLedgerID
+                                              ), TR.TransactionDTO,
+                         TR.TransactionID
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ) BeginningBalanceAward,
+            ROW_NUMBER() OVER (PARTITION BY TR.TransactionID,
+                                 ISNULL(
+                                       lu.TransactionLedgerID,
+                                       ls.TransactionLedgerID
+                                       )
+                               ORDER BY IIF(
+                                        ISNULL(PGLU.PropertyID, PGL.PropertyID) = TR.TransactionPropertyID,
+                                        1,
+                                        2)
+                              ) RNumLedger,
+            ISNULL(ISNULL(lu.BucketAmount, ls.BucketAmount), 0.0) BucketAmount,
+            TR.InterfaceID, TR.TransactionInitiatorStatusID, p.PlayerID,
+            t.PrimaryBucketViewID, t.EarnedPropertyID, TR.ParentTransactionID,
+            ISNULL(lu.TransactionLedgerID, ls.TransactionLedgerID) LedgerID
+          FROM
+          (
+            SELECT t.TransactionID, bvl.PrimaryBucketViewID, t.GamingDate,
+              t.TransactionPropertyID EarnedPropertyID, bvl.CurrencySymbol,
+              bvl.DataPrecision, bvl.BucketViewDisplayName,
+              IIF(
+                t.TransactionInitiatorStatusID = @VoidTransactionInitiatorStatusID,
+                -10,
+                t.TransactionTypeID) TransactionDerivedTypeID
+            FROM EB.Transactions t WITH (NOLOCK)
+              INNER JOIN @BucketViewList bvl ON t.BucketViewID = bvl.BucketViewID
+              INNER JOIN @tPlayerID ul ON ul.PlayerID = t.PlayerID
+            WHERE (t.GamingDate >= @FromDate AND t.GamingDate <= @ToDate)
+          ) t
+            INNER JOIN EB.Transactions TR WITH (NOLOCK) ON TR.TransactionID = t.TransactionID
+            INNER JOIN dbo.PropertyGroupList PGL ON PGL.PropertyGroupID = TR.PropertyGroupID
+            INNER JOIN dbo.UC_X_Property pr ON IIF(tr.PropertyGroupID = 0,
+                                               tr.TransactionPropertyID,
+                                               pgl.PropertyID) = pr.PropertyID
+            INNER JOIN dbo.UC_PL_Player p ON TR.PlayerID = p.PlayerID
+            LEFT JOIN EB.Transactions tp WITH (NOLOCK) ON tp.TransactionID = tr.ParentTransactionID
+            LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                              AND ls.UsageTransactionID IS NULL
+            LEFT JOIN eb.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+            LEFT JOIN EB.Transactions TU WITH (NOLOCK) ON lu.SourceTransactionID = tu.TransactionID
+            LEFT JOIN dbo.PropertyGroupList PGLU ON PGLU.PropertyGroupID = TU.PropertyGroupID
+                                                   AND TR.TransactionTypeID <> @ExpiredTransactionTypeID
+            LEFT JOIN EB.TransactionOfferReferences tor WITH (NOLOCK) ON t.transactionid = tor.TransactionID
+                                                                        AND tor.TransactionID > 0
+        ) T
+          INNER JOIN @PropertyList PRL ON PRL.PropertyID = T.EarnedPropertyID
+          LEFT JOIN #FinalMaxPropertyPlayerBalance F ON F.PlayerID = T.PlayerId
+                                                       AND F.PrimaryBucketViewID = t.PrimaryBucketViewID
+                                                       AND F.PropertyID = T.EarnedPropertyID
+          LEFT JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = T.PlayerID
+                                                           AND FOA.PrimaryBucketViewID = t.PrimaryBucketViewID
+                                                           AND FOA.PropertyID = T.EarnedPropertyID
+        WHERE T.RNumLedger = 1
+      ) T
+        OUTER APPLY
+      (
+        SELECT SUM(ESB.CostToPlayer * ISNULL(BA.AllocationCount, 0)) AS Eventtickets
+        FROM EVT.UC_X_EventScheduleBlock AS ESB WITH (NOLOCK)
+          INNER JOIN EVT.UC_X_EventSchedule AS ES WITH (NOLOCK) ON ESB.EventScheduleID = ES.EventScheduleID
+          INNER JOIN EVT.UC_PL_BlockAllocation AS BA WITH (NOLOCK) ON BA.EventScheduleBlockID = ESB.EventScheduleBlockID
+          INNER JOIN EVT.UC_X_AllocationStatus AS EAS WITH (NOLOCK) ON EAS.AllocationStatusID = BA.AllocationStatusID
+        WHERE BA.PlayerID = T.PlayerID
+      ) AS BlockEvents
+      WHERE T.RNum = 1
+      OPTION (RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+      DROP TABLE IF EXISTS #BalBef;
+      CREATE TABLE #BalBef
+      (
+        BalBefID int IDENTITY(1, 1) PRIMARY KEY,
+        MaxPropertyBalance money NULL,
+        PlayerID bigint NOT NULL,
+        PrimaryBucketViewID smallint NOT NULL
+      );
+
+      INSERT INTO #BalBef (PlayerID, PrimaryBucketViewID, MaxPropertyBalance)
+      SELECT PlayerID, PrimaryBucketViewID, SUM(MaxPropertyBalance)
+      FROM #FinalMaxPropertyPlayerBalance
+      GROUP BY PlayerID, PrimaryBucketViewID;
+
+      INSERT INTO #ResultSet
+      (
+        Bucket, Property, UniversalID, FirstName, LastName, GamingDate,
+        TransactionDateTime, BeginningBalance, Earned, Voided, EGMDownloaded,
+        Adjustments, Expired, ExternalRewards, Prize, Eventtickets,
+        BucketAward, Redeemed, Issued, Promooffers, NCEPOut, SOURCE,
+        CurrencySymbol, DataPrecision, IsIgnoreEB, PartialRedeemAmount,
+        TransactionID
+      )
+      SELECT T.Bucket, T.Property, T.UniversalPlayerID UniversalID,
+        T.FirstName, T.LastName, T.GamingDate, T.TransactionDateTime,
+        T.BeginningBalance,
+        IIF(
+          T.TransactionDerivedTypeID = @EarningTransactionTypeID
+             OR
+             (
+               t.TransactionDerivedTypeID = @DepositTransactionTypeID
+               AND t.TransactionInitiatorID = @TierBonusInitiatorID
+             ),
+          T.AmountofTransaction,
+          0) AS Earned,
+        IIF(T.TransactionDerivedTypeID = -10, T.AmountofTransaction, 0) AS Voided,
+        IIF(
+          T.TransactionDerivedTypeID IN (@NCEPInTransactionTypeID,
+                                        @CEPInTransactionTypeID
+                                        ),
+          T.AmountofTransaction,
+          0) AS EGMDownloaded,
+        IIF(
+          T.TransactionDerivedTypeID = @AdjustmentTransactionTypeID
+             AND T.InterfaceID NOT IN (@SpeedMediaInterfaceID,
+                                      @KioskInterfaceID, @OneLinkInterfaceID,
+                                      @MobilityInterfaceID
+                                      )
+             AND ISNULL(T.TransactionInitiatorID, 0) <> @EventBlockInitiatorID,
+          T.AmountofTransaction,
+          0) AS Adjustments,
+        IIF(T.TransactionDerivedTypeID = @ExpiredTransactionTypeID,
+          T.AmountofTransaction,
+          0) AS Expired,
+        IIF(
+          T.TransactionDerivedTypeID IN (@DepositTransactionTypeID,
+                                        @RewardTransactionTypeID
+                                        )
+             AND T.InterfaceID IN (@SpeedMediaInterfaceID, @KioskInterfaceID,
+                                  @OneLinkInterfaceID, @MobilityInterfaceID
+                                  )
+             AND T.TransactionInitiatorID <> @TierBonusInitiatorID
+             AND T.TransactionDerivedTypeID <> -10
+             AND T.SOURCE = 'Bucket',
+          T.AmountofTransaction,
+          0) AS ExternalRewards,
+        IIF(
+          EXISTS
+    (
+      SELECT 1
+      FROM AWA.UC_PL_PrizeRedemptionDetail
+      WHERE t.SequenceNumber = RedeemedTransactionID
+    )
+             AND T.TransactionDerivedTypeID <> -10,
+          T.AmountofTransaction,
+          0) AS Prize,
+        IIF(
+          BlockEvents.Eventtickets IS NOT NULL
+             AND T.TransactionInitiatorID = @EventBlockInitiatorID
+             AND T.TransactionDerivedTypeID <> -10,
+          T.AmountofTransaction,
+          0) AS Eventtickets,
+        IIF(
+          T.SOURCE = 'Bucket Award'
+             AND T.TransactionInitiatorStatusID = @AvailableTransactionInitiatorStatusID,
+          T.AmountofTransaction,
+          0) AS BucketAward,
+        CASE
+          WHEN T.TransactionInitiatorID IN (@CompItemInitiatorID,
+                                           @NonCompItemInitiatorID
+                                           )
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.ParentTransactionID IS NOT NULL THEN
+            ISNULL(T.AmountofTransaction, 0.0)
+            + IIF(
+                T.Rnump = 1
+                   and ISNULL(T.AmountofTransaction, 0.0) >= 0,
+                ISNULL(T.AmountIssued, 0),
+                0.0)
+          WHEN T.TransactionDerivedTypeID IN (@RedeemTransactionTypeID,
+                                               @DepositTransactionTypeID,
+                                               @NCEPInTransactionTypeID,
+                                               @CEPInTransactionTypeID
+                                             )
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.TransactionInitiatorID NOT IN (@PromoOfferInitiatorID,
+                                                @EventBlockInitiatorID,
+                                                @TierBonusInitiatorID
+                                                )
+            AND T.InterfaceID NOT IN (@EGMInterfaceID)
+            AND NOT EXISTS
+    (
+      SELECT 1
+      FROM AWA.UC_PL_PrizeRedemptionDetail
+      WHERE t.SequenceNumber = RedeemedTransactionID
+    )
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID THEN
+            T.AmountofTransaction
+          ELSE 0
+        END AS Redeemed,
+        IIF(
+          T.TransactionInitiatorStatusID = @IssueTransactionInitiatorStatusID
+             AND T.TransactionInitiatorID IN (@CompItemInitiatorID,
+                                             @NonCompItemInitiatorID
+                                             )
+             AND T.TransactionDerivedTypeID NOT IN (@DepositTransactionTypeID,
+                                                     @NCEPInTransactionTypeID,
+                                                     @CEPInTransactionTypeID,
+                                                     @EventBlockInitiatorID,
+                                                     -10
+                                                   )
+             AND NOT EXISTS
+    (
+      SELECT 1
+      FROM AWA.UC_PL_PrizeRedemptionDetail
+      WHERE t.SequenceNumber = RedeemedTransactionID
+    )   ,
+          T.AmountofTransaction,
+          0) AS Issued,
+        IIF(
+          T.TransactionInitiatorID = @PromoOfferInitiatorID
+             AND T.TransactionDerivedTypeID <> -10,
+          T.AmountofTransaction,
+          0) AS Promooffers,
+        IIF(T.TransactionDerivedTypeID = @NCEPOutTransactionTypeID,
+          T.AmountofTransaction,
+          0) AS NCEPOut, T.SOURCE, T.CurrencySymbol, T.DataPrecision,
+        CASE
+          WHEN T.TransactionInitiatorID IN (@CompItemInitiatorID,
+                                           @NonCompItemInitiatorID
+                                           )
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.ParentTransactionID IS NOT NULL
+            AND T.AmountofTransaction = 0 THEN 1
+          ELSE 0
+        END AS IsIgnoreEB,
+        CASE
+          WHEN T.TransactionInitiatorID IN (@CompItemInitiatorID,
+                                           @NonCompItemInitiatorID
+                                           )
+            AND T.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID
+            AND T.TransactionDerivedTypeID <> -10
+            AND T.ParentTransactionID IS NOT NULL
+            AND T.AmountofTransaction IS NOT NULL THEN T.AmountofTransaction
+          ELSE 0
+        END AS PartialRedeemAmount, T.SequenceNumber AS TransactionID
+      FROM
+      (
+        SELECT T.Bucket, T.Property, T.UniversalPlayerID, T.FirstName,
+          T.LastName, t.playerID, t.TransactionDateTime,
+          ISNULL(FOA.RunningBalance, 0.00) + ISNULL(F.MaxPropertyBalance, 0.00)
+          + ISNULL(T.BeginningBalanceBucket, 0.0)
+          + ISNULL(T.BeginningBalanceAward, 0.0) BeginningBalance,
+          SUM(T.BucketAmount) OVER (PARTITION BY T.SequenceNumber, T.RNumLedger ORDER BY T.SequenceNumber) AmountofTransaction,
+          T.ParentTransactionID, T.SequenceNumber, T.CurrencySymbol,
+          T.DataPrecision, T.TransactionDerivedTypeID, T.EarnedPropertyID,
+          IIF(
+            LEAD(T.SequenceNumber, 1) OVER (ORDER BY T.Rnump) = T.SequenceNumber
+               AND LEAD(T.SOURCE, 1) OVER (ORDER BY T.Rnump) <> T.SOURCE,
+            'Multiple',
+            T.SOURCE) SOURCE, T.TransactionInitiatorID, T.InterfaceID,
+          T.TransactionInitiatorStatusID, T.GamingDate,
+          ROW_NUMBER() OVER (PARTITION BY T.SequenceNumber, T.RNumLedger
+ORDER BY T.RNumLedger, T.LedgerID
+                            ) Rnum, T.AmountIssued, T.Rnump
+        FROM
+        (
+          SELECT t.BucketViewDisplayName AS Bucket, pr.PropertyName Property,
+            p.UniversalPlayerID, p.FirstName, p.LastName, t.GamingDate,
+            CONVERT(datetime2, tr.TransactionDTO AT TIME ZONE @TimeZone) TransactionDateTime,
+            t.TransactionID AS SequenceNumber, t.CurrencySymbol,
+            t.DataPrecision, t.TransactionDerivedTypeID,
+            CASE
+              WHEN ISNULL(lu.TransactionInitiatorID, ls.TransactionInitiatorID) = @BucketAwardInitiatorID then
+                'Bucket Award'
+              WHEN ISNULL(lu.TransactionInitiatorID, ls.TransactionInitiatorID) = @PromoOfferInitiatorID then
+                'Promo Offer'
+              ELSE 'Bucket'
+            END AS SOURCE, TR.TransactionInitiatorID,
+            SUM(IIF(
+                  ISNULL(TU.TransactionInitiatorID, TR.TransactionInitiatorID) <> @BucketAwardInitiatorID,
+                  ISNULL(lu.BucketAmount, ls.BucketAmount),
+                  0.00)
+               ) OVER (PARTITION BY TR.PlayerID, t.PrimaryBucketViewID
+                       ORDER BY ISNULL(
+                                              lu.TransactionLedgerID,
+                                              ls.TransactionLedgerID
+                                              ), TR.TransactionDTO,
+                         TR.TransactionID
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ) BeginningBalanceBucket,
+            SUM(IIF(
+                  ISNULL(TU.TransactionInitiatorID, TR.TransactionInitiatorID) IN (
+                                                                                  @BucketAwardInitiatorID,
+                                                                                  @PromoOfferInitiatorID
+                                                                                  ),
+                  ISNULL(lu.BucketAmount, ls.BucketAmount),
+                  0.00)
+               ) OVER (PARTITION BY TR.PlayerID, t.PrimaryBucketViewID,
+                         IIF(
+                           ISNULL(
+                                         TU.TransactionInitiatorID,
+                                         TR.TransactionInitiatorID
+                                         ) IN (@BucketAwardInitiatorID,
+                                              @PromoOfferInitiatorID
+                                              ),
+                           ISNULL(PGLU.PropertyID, PGL.PropertyID),
+                           TR.TransactionPropertyID)
+                       ORDER BY ISNULL(
+                                              lu.TransactionLedgerID,
+                                              ls.TransactionLedgerID
+                                              ), TR.TransactionDTO,
+                         TR.TransactionID
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                      ) BeginningBalanceAward,
+            ROW_NUMBER() OVER (PARTITION BY TR.TransactionID,
+                                 ISNULL(
+                                       lu.TransactionLedgerID,
+                                       ls.TransactionLedgerID
+                                       )
+                               ORDER BY IIF(
+                                        ISNULL(PGLU.PropertyID, PGL.PropertyID) = TR.TransactionPropertyID,
+                                        1,
+                                        2)
+                              ) RNumLedger,
+            (ISNULL(lu.BucketAmount, 0) + ISNULL(ls.BucketAmount, 0)) BucketAmount,
+            TR.InterfaceID, TR.TransactionInitiatorStatusID, p.PlayerID,
+            t.PrimaryBucketViewID, t.EarnedPropertyID, TR.ParentTransactionID,
+            IIF(tp.Amount IS NULL, 0, tp.Amount) AmountIssued,
+            ROW_NUMBER() OVER (PARTITION BY TR.PlayerID,
+                                 IIF(
+                                   TR.TransactionInitiatorStatusID = @RedeemTransactionInitiatorStatusID,
+                                   TR.ParentTransactionID,
+                                   0)
+                               ORDER BY tr.TransactionDTO, TR.TransactionID
+                              ) Rnump,
+            ISNULL(lu.TransactionLedgerID, ls.TransactionLedgerID) LedgerID
+          FROM
+          (
+            SELECT t.TransactionID, bvl.PrimaryBucketViewID, t.GamingDate,
+              t.TransactionPropertyID EarnedPropertyID, bvl.CurrencySymbol,
+              bvl.DataPrecision, bvl.BucketViewDisplayName,
+              IIF(
+                t.TransactionInitiatorStatusID = @VoidTransactionInitiatorStatusID,
+                -10,
+                t.TransactionTypeID) TransactionDerivedTypeID
+            FROM EB.Transactions t WITH (NOLOCK)
+              INNER JOIN @BucketViewList bvl ON t.BucketViewID = bvl.BucketViewID
+              INNER JOIN @tPlayerID ul ON ul.PlayerID = t.PlayerID
+            WHERE (t.GamingDate >= @FromDate AND t.GamingDate <= @ToDate)
+          ) t
+            INNER JOIN EB.Transactions TR WITH (NOLOCK) ON TR.TransactionID = t.TransactionID
+            INNER JOIN dbo.PropertyGroupList PGL ON PGL.PropertyGroupID = TR.PropertyGroupID
+            INNER JOIN dbo.UC_X_Property pr ON IIF(tr.PropertyGroupID = 0,
+                                               tr.TransactionPropertyID,
+                                               pgl.PropertyID) = pr.PropertyID
+            INNER JOIN dbo.UC_PL_Player p ON TR.PlayerID = p.PlayerID
+            LEFT JOIN EB.Transactions tp WITH (NOLOCK) ON tp.TransactionID = tr.ParentTransactionID
+            LEFT JOIN EB.TransactionLedger ls WITH (NOLOCK) ON t.TransactionID = ls.SourceTransactionID
+                                                              AND ls.UsageTransactionID IS NULL
+            LEFT JOIN eb.TransactionLedger lu WITH (NOLOCK) ON t.TransactionID = lu.UsageTransactionID
+            LEFT JOIN EB.Transactions TU WITH (NOLOCK) ON lu.SourceTransactionID = tu.TransactionID
+            LEFT JOIN dbo.PropertyGroupList PGLU ON PGLU.PropertyGroupID = TU.PropertyGroupID
+                                                   AND TR.TransactionTypeID <> @ExpiredTransactionTypeID
+            LEFT JOIN EB.TransactionOfferReferences tor WITH (NOLOCK) ON t.transactionid = tor.TransactionID
+                                                                        AND tor.TransactionID > 0
+        ) T
+          INNER JOIN @PropertyList PRL ON PRL.PropertyID = T.EarnedPropertyID
+          LEFT JOIN #BalBef F ON F.PlayerID = T.PlayerId
+                                AND F.PrimaryBucketViewID = t.PrimaryBucketViewID
+          LEFT JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = T.PlayerID
+                                                           AND FOA.PrimaryBucketViewID = t.PrimaryBucketViewID
+                                                           AND FOA.PropertyID = T.EarnedPropertyID
+        WHERE T.RNumLedger = 1
+      ) T
+        OUTER APPLY
+      (
+        SELECT SUM(ESB.CostToPlayer * ISNULL(BA.AllocationCount, 0)) AS Eventtickets
+        FROM EVT.UC_X_EventScheduleBlock AS ESB WITH (NOLOCK)
+          INNER JOIN EVT.UC_X_EventSchedule AS ES WITH (NOLOCK) ON ESB.EventScheduleID = ES.EventScheduleID
+          INNER JOIN EVT.UC_PL_BlockAllocation AS BA WITH (NOLOCK) ON BA.EventScheduleBlockID = ESB.EventScheduleBlockID
+          INNER JOIN EVT.UC_X_AllocationStatus AS EAS WITH (NOLOCK) ON EAS.AllocationStatusID = BA.AllocationStatusID
+        WHERE BA.PlayerID = T.PlayerID
+      ) AS BlockEvents
+      WHERE T.RNum = 1
+      OPTION (RECOMPILE);
+    END;
+
+    IF EXISTS (SELECT 1 FROM #ResultSet)
+    BEGIN
+      SELECT Bucket, Property, UniversalID, FirstName, LastName, GamingDate,
+        TransactionDateTime, BeginningBalance, Earned, Voided, EGMDownloaded,
+        Adjustments, Expired, ExternalRewards, Prize, Eventtickets,
+        BucketAward, Redeemed, Issued, Promooffers, NCEPOut, SOURCE,
+        CurrencySymbol, DataPrecision, IsIgnoreEB, PartialRedeemAmount,
+        TransactionID
+      FROM #ResultSet;
+    END;
+    ELSE
+    BEGIN
+      SELECT DISTINCT bv.PrimaryBucketViewDisplayName AS Bucket,
+        NULL AS Property, P.UniversalPlayerID AS UniversalID, P.FirstName,
+        P.LastName, NULL AS GamingDate, NULL AS TransactionDateTime,
+        (ISNULL(bbal.MaxPropertyBalance, 0) + ISNULL(FOA.RunningBalance, 0)) BeginningBalance,
+        0.00 AS Earned, 0.00 AS Voided, 0.00 AS EGMDownloaded,
+        0.00 AS Adjustments, 0.00 AS Expired, 0.00 AS ExternalRewards,
+        0.00 AS Prize, 0.00 AS Eventtickets, 0.00 AS BucketAward,
+        0.00 AS Redeemed, 0.00 AS Issued, 0.00 AS Promooffers, 0.00 AS NCEPOut,
+        NULL AS SOURCE, bv.CurrencySymbol, bv.DataPrecision,
+        NULL AS IsIgnoreEB, 0.00 AS PartialRedeemAmount, NULL AS TransactionID
+      FROM @UniversalIDList up
+        INNER JOIN dbo.UC_PL_Player P WITH (NOLOCK) ON up.PlayerID = P.PlayerID
+        LEFT JOIN dbo.UC_PL_DomProp dp WITH (NOLOCK) ON dp.PlayerID = P.PlayerID
+        LEFT JOIN dbo.UC_X_Property dprop ON dp.DominantProperty = dprop.PropertyID
+        CROSS APPLY
+      (
+        SELECT DISTINCT PrimaryBucketViewID, PrimaryBucketViewDisplayName,
+          CurrencySymbol, DataPrecision
+        FROM @BucketViewList
+      ) bv
+        LEFT JOIN #FinalMaxPropertyPlayerBalance bbal ON P.PlayerID = bbal.PlayerID
+                                                        AND bbal.PrimaryBucketViewID = bv.PrimaryBucketViewID
+                                                        AND bbal.PropertyID = dp.DominantProperty
+        FULL OUTER JOIN #FinalOfferAwardBalancesProperty FOA ON FOA.PlayerID = bbal.PlayerID
+                                                               AND FOA.PrimaryBucketViewID = bbal.PrimaryBucketViewID
+                                                               AND FOA.PropertyID = bbal.PropertyID;
+    END;
+  END TRY
+  BEGIN CATCH
+    THROW;
+  END CATCH;
+END;
+GO
+------STARTING NEW SP------
