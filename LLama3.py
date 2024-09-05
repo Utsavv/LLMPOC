@@ -189,7 +189,6 @@ def write_to_file(content, filename):
         file.write(content)
 
 
-# Example3_Business_question_Scenario()
 def Example4_CreateNewSP():
     TrainingData = read_files_from_folder()
     Question = (
@@ -203,5 +202,39 @@ def Example4_CreateNewSP():
     Process_text(Question)
 
 
-Example4_CreateNewSP()
-# Example3_Business_question_Scenario()
+def Example5_CreateTestCasesFromCode():
+    TableScript1 = read_text_file(
+        "C:\W\GIT\LLMPOC\LLMPOC\AdventureWorks\HumanResources.Employee.sql"
+    )
+    TableScript2 = read_text_file(
+        "C:\W\GIT\LLMPOC\LLMPOC\AdventureWorks\Person.Person.sql"
+    )
+    TableScript3 = read_text_file(
+        "C:\W\GIT\LLMPOC\LLMPOC\AdventureWorks\Person.BusinessEntity.sql"
+    )
+    SPScript = read_text_file(
+        "C:\W\GIT\LLMPOC\LLMPOC\AdventureWorks\dbo.uspGetManagerEmployees.sql"
+    )
+
+    Question = (
+        "Assume that you are a manual test engineer. You task is to write extensive test case to cover stored procedure dbo.uspGetManagerEmployees."
+        + "This stored procedure using a recursive query to return the direct and indirect employees of the specified manager."
+        + "Input parameter of this SP is to enter a valid BusinessEntityID of the manager from the HumanResources.Employee table"
+        + "First table script is - "
+        + TableScript1
+        + "2nd table script is - "
+        + TableScript2
+        + "Third table script is - "
+        + TableScript3
+        + "SQL SP definition is - "
+        + SPScript
+    )
+
+    Process_text(Question)
+
+
+Example1_SummarizePDF()
+Exmaple2_ComparePDF()
+Example3_Business_question_Scenario()
+Example5_CreateTestCasesFromCode()
+# Example4_CreateNewSP()
