@@ -11,8 +11,11 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 from datasets import load_dataset
 
 # Load the tokenizer and model
-model_name = "C:\\Users\\vermau\\.cache\\lm-studio\\models\\lmstudio-community\\Meta-Llama-3.1-8B-Instruct-GGUF\\Meta-Llama-3.1-8B-Instruct-Q4_K_M-take2.gguf"
-tokenizer_name = "C:\\Users\\vermau\\.cache\\lm-studio\\models\\lmstudio-community\\Meta-Llama-3.1-8B-Instruct-GGUF\\tokenizer"
+model_ = r"C:\Users\vermau\.llama\checkpoints\Meta-Llama3.1-8B-Instruct"
+tokenizer_name = (
+    r"C:\Users\vermau\.llama\checkpoints\Meta-Llama3.1-8B-Instruct\tokenizer.model"
+)
+
 tokenizer = LlamaTokenizer.from_pretrained(model_name, local_files_only=True)
 model = LlamaForCausalLM.from_pretrained(model_name, local_files_only=True)
 

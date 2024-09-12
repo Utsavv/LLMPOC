@@ -15,25 +15,3 @@ CREATE TABLE [Person].[Person]
 [ModifiedDate] [datetime] NOT NULL CONSTRAINT [DF_Person_ModifiedDate] DEFAULT (getdate())
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
-ALTER TABLE [Person].[Person] ADD CONSTRAINT [CK_Person_EmailPromotion] CHECK (([EmailPromotion]>=(0) AND [EmailPromotion]<=(2)))
-GO
-ALTER TABLE [Person].[Person] ADD CONSTRAINT [CK_Person_PersonType] CHECK (([PersonType] IS NULL OR (upper([PersonType])='GC' OR upper([PersonType])='SP' OR upper([PersonType])='EM' OR upper([PersonType])='IN' OR upper([PersonType])='VC' OR upper([PersonType])='SC')))
-GO
-ALTER TABLE [Person].[Person] ADD CONSTRAINT [PK_Person_BusinessEntityID] PRIMARY KEY CLUSTERED ([BusinessEntityID]) ON [PRIMARY]
-GO
-CREATE NONCLUSTERED INDEX [IX_Person_LastName_FirstName_MiddleName] ON [Person].[Person] ([LastName], [FirstName], [MiddleName]) ON [PRIMARY]
-GO
-CREATE UNIQUE NONCLUSTERED INDEX [AK_Person_rowguid] ON [Person].[Person] ([rowguid]) ON [PRIMARY]
-GO
-CREATE PRIMARY XML INDEX [PXML_Person_AddContact] ON [Person].[Person] ([AdditionalContactInfo])
-GO
-CREATE PRIMARY XML INDEX [PXML_Person_Demographics] ON [Person].[Person] ([Demographics])
-GO
-CREATE XML INDEX [XMLPATH_Person_Demographics] ON [Person].[Person] ([Demographics]) USING XML INDEX [PXML_Person_Demographics] FOR PATH
-GO
-CREATE XML INDEX [XMLPROPERTY_Person_Demographics] ON [Person].[Person] ([Demographics]) USING XML INDEX [PXML_Person_Demographics] FOR PROPERTY
-GO
-CREATE XML INDEX [XMLVALUE_Person_Demographics] ON [Person].[Person] ([Demographics]) USING XML INDEX [PXML_Person_Demographics] FOR VALUE
-GO
-ALTER TABLE [Person].[Person] ADD CONSTRAINT [FK_Person_BusinessEntity_BusinessEntityID] FOREIGN KEY ([BusinessEntityID]) REFERENCES [Person].[BusinessEntity] ([BusinessEntityID])
-GO

@@ -1,0 +1,42 @@
+[
+    {
+        "prompt": "What is the capital of France?",
+        "completion": "The capital of France is Paris."
+    },
+    {
+        "prompt": "What is the largest planet in our solar system?",
+        "completion": "The largest planet in our solar system is Jupiter."
+    },
+    {
+        "prompt": "Who wrote 'To Kill a Mockingbird'?",
+        "completion": "Harper Lee wrote 'To Kill a Mockingbird'."
+    },
+    {
+        "prompt": "What is the boiling point of water?",
+        "completion": "The boiling point of water is 100 degrees Celsius at sea level."
+    },
+    {
+        "prompt": "What is the process of photosynthesis?",
+        "completion": "Photosynthesis is the process by which green plants use sunlight to synthesize foods with the help of chlorophyll."
+    },
+    {
+        "prompt": "What is the chemical symbol for gold?",
+        "completion": "The chemical symbol for gold is Au."
+    },
+    {
+        "prompt": "What is the main ingredient in guacamole?",
+        "completion": "The main ingredient in guacamole is avocado."
+    },
+    {
+        "prompt": "What year did the Titanic sink?",
+        "completion": "The Titanic sank in the year 1912."
+    },
+    {
+        "prompt": "Who painted the Mona Lisa?",
+        "completion": "The Mona Lisa was painted by Leonardo da Vinci."
+    },
+    {
+        "prompt": "What is the speed of light?",
+        "completion": "The speed of light in a vacuum is approximately 299,792 kilometers per second."
+    }
+]
