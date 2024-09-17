@@ -157,9 +157,7 @@ def Example3_Business_question_Scenario():
     file_path = "C:\W\GIT\LLMPOC\LLMPOC\AdventureWorks\PERSON.BusinessEntityAddress.sql"
     person_BusinessEntityAddress = read_text_file(file_path)
 
-    Business_Question = (
-        "Get me complete address of all persons living in city San Francisco?"
-    )
+    Business_Question = "Get me complete address, including full name, of all persons living in city San Francisco?"
 
     Question = (
         "Assume that you are a SQL developer and you need to write a sql query to provide answer to question asked by a business user\n\n"
@@ -172,7 +170,8 @@ def Example3_Business_question_Scenario():
         + person_BusinessEntityAddress
         + "\n\nTable structure 3 - \n\n"
         + person_person
-        + "\n\n Please provide only SQL query and no explanation or pretext or markdown. I want to use output as it is to execute query without any modification."
+        + "\n\n Please provide only SQL query and no explanation or pretext or markdown or unwanted special characters."
+        + "\n\n I want to use output as it is to execute query without any modification."
     )
 
     Query = Process_return_text(Question)
@@ -227,13 +226,13 @@ def Example5_CreateTestCasesFromCode():
         "Assume that you are a manual test engineer. You task is to write extensive test case to cover stored procedure dbo.uspGetManagerEmployees."
         + "\nThis stored procedure using a recursive query to return the direct and indirect employees of the specified manager."
         + "\nInput parameter of this SP is to enter a valid BusinessEntityID of the manager from the HumanResources.Employee table"
-        + "\n\nFirst table script is - "
+        + "\n\nFirst table script is - \n\n"
         + TableScript1
-        + "\n\n2nd table script is - "
+        + "\n\n2nd table script is - \n\n"
         + TableScript2
-        + "\n\nThird table script is - "
+        + "\n\nThird table script is - \n\n"
         + TableScript3
-        + "\n\nSQL SP definition is - "
+        + "\n\nSQL SP definition is - \n\n"
         + SPScript
         + "\n\nAlso, please provide explanation of SP in simple english."
     )
